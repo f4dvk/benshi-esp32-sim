@@ -1,4 +1,6 @@
 #pragma once
+#include <functional>
+#include <atomic>
 #include "BenshiProtocol.h"
 #include "RadioState.h"
 #include "config.h"
@@ -14,14 +16,20 @@
 //   SET_REGION        changer la région active
 //   WRITE_REGION_NAME renommer une région
 //
-// Toutes ces modifications sont persistées en NVS (voir RadioState.h).
-// HTCommander relit systématiquement après une écriture, donc l'UI se met à
-// jour sans qu'on ait besoin d'émettre d'EVENT_NOTIFICATION.
+// EVENT_NOTIFICATION (HT_STATUS_CHANGED) : la vraie VR-N76 pousse ces trames
+// dès qu'un paramètre change ET pendant la réception (squelch/RSSI). On les
+// reproduit : HTCommander s'y abonne via REGISTER_NOTIFICATION juste après
+// GET_DEV_INFO, et son indicateur RX / S-mètre en dépend.
 // ============================================================================
 
 class BenshiCommandHandler {
 public:
+    // Envoi d'un message NON sollicité sur le canal commande (branché par le
+    // transport). Peut être appelé depuis n'importe quelle tâche.
+    using NotifSink = std::function<void(const BenshiMessage&)>;
+
     void begin() { state_.begin(); }
+    void onNotify(NotifSink sink) { sink_ = std::move(sink); }
 
     // Traite un message entrant et renvoie true si une réponse doit être
     // envoyée (outMsg rempli).
@@ -47,6 +55,10 @@ public:
             outMsg.body = BenshiReplies::readStatus(statusType);
 
         } else if (in.command == REGISTER_NOTIFICATION) {
+            for (uint8_t t : in.body) {
+                if (t < 16) registeredMask_ |= (uint16_t)(1u << t);
+            }
+            Serial.printf("[CMD] REGISTER_NOTIFICATION : masque = 0x%04X\n", registeredMask_);
             outMsg.body = BenshiReplies::registerNotifAck();
 
         } else if (in.command == READ_SETTINGS) {
@@ -56,6 +68,7 @@ public:
             bool ok = state_.setSettingsStruct(in.body.data(), in.body.size());
             outMsg.body = BenshiReplies::writeSettingsAck(
                 ok ? ReplyStatus::SUCCESS : ReplyStatus::INVALID_PARAMETER);
+            if (ok) htStatusDirty_ = true;
 
         } else if (in.command == READ_RF_CH) {
             uint8_t channelId = in.body.empty() ? 0 : in.body[0];
@@ -67,11 +80,13 @@ public:
             bool ok = state_.setChannelStruct(channelId, in.body.data(), in.body.size());
             outMsg.body = BenshiReplies::writeRfChAck(
                 ok ? ReplyStatus::SUCCESS : ReplyStatus::INVALID_PARAMETER, channelId);
+            if (ok) htStatusDirty_ = true;
 
         } else if (in.command == SET_REGION) {
             uint8_t regionId = in.body.empty() ? 0 : in.body[0];
             state_.setRegion(regionId);
             outMsg.body = BenshiReplies::regionAck(ReplyStatus::SUCCESS, regionId);
+            htStatusDirty_ = true;
 
         } else if (in.command == WRITE_REGION_NAME) {
             if (in.body.empty()) {
@@ -91,7 +106,8 @@ public:
             outMsg.body = BenshiReplies::regionName(state_, regionId);
 
         } else if (in.command == GET_HT_STATUS) {
-            outMsg.body = BenshiReplies::htStatus(state_, false, false);
+            outMsg.body = BenshiReplies::htStatus(state_, false, sqOpen_.load(),
+                                                  rssi_.load(), aocConnected_.load());
 
         } else if (in.command == SET_PHONE_STATUS) {
             outMsg.body = BenshiReplies::phoneStatusAck();
@@ -104,6 +120,50 @@ public:
         return true;
     }
 
+    // À appeler par le transport APRÈS avoir envoyé la réponse à la commande
+    // courante : émet la notification de statut si une écriture l'a salie.
+    void flushPendingNotifications() {
+        if (htStatusDirty_) {
+            htStatusDirty_ = false;
+            emitHtStatusChanged();
+        }
+    }
+
+    // --- Hooks du pont audio (contexte tâche) ---------------------------------
+    // Réception audio en cours : squelch/RX ouverts + RSSI 0..15 dérivé du PCM.
+    void setAudioRx(bool active, uint8_t rssi) {
+        bool changed = (active != sqOpen_.load()) || (rssi != rssi_.load());
+        sqOpen_.store(active);
+        rssi_.store(active ? rssi : 0);
+        if (changed) emitHtStatusChanged();
+    }
+    // Canal audio RFCOMM connecté / déconnecté.
+    void setAudioConnected(bool c) {
+        if (c == aocConnected_.load()) return;
+        aocConnected_.store(c);
+        emitHtStatusChanged();
+    }
+
+    void emitHtStatusChanged() {
+        if (!sink_) return;
+        if (!(registeredMask_ & (1u << EventType::HT_STATUS_CHANGED))) return;
+        BenshiMessage m;
+        m.command_group = CommandGroup::BASIC;
+        m.is_reply      = false;
+        m.command       = BasicCommand::EVENT_NOTIFICATION;
+        m.body = BenshiReplies::htStatusChangedEvent(state_, false, sqOpen_.load(),
+                                                     rssi_.load(), aocConnected_.load());
+        sink_(m);
+    }
+
 private:
     RadioState state_;
+    NotifSink  sink_;
+
+    uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré
+    bool     htStatusDirty_  = false;
+
+    std::atomic<bool>    sqOpen_{false};
+    std::atomic<uint8_t> rssi_{0};
+    std::atomic<bool>    aocConnected_{false};
 };

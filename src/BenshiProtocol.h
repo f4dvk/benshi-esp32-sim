@@ -237,23 +237,44 @@ namespace BenshiReplies {
     //          bit2 is_hfp_connected, bit1 is_aoc_connected
     //   msg[7] bits[7:4] rssi, bits[3:0] curr_region[5:2]
     //   msg[8] bits[7:6] curr_region[1:0], bits[5:2] curr_ch_id[7:4]
-    inline std::vector<uint8_t> htStatus(const RadioState& st, bool inTx, bool sqOpen) {
-        const uint8_t region  = st.region() & 0x3F;
-        const uint8_t chId    = st.activeChannelId();
-        const uint8_t dualCh  = st.doubleChannel() & 0x03;
+    // Remplit les 4 octets de StatusExt dans out[0..3] (voir la disposition
+    // ci-dessus). `rssi` : 0..15. `aocConn` : canal audio RFCOMM connecte.
+    inline void packHtStatus(const RadioState& st, bool inTx, bool sqOpen,
+                             uint8_t rssi, bool aocConn, uint8_t out[4]) {
+        const uint8_t region = st.region() & 0x3F;
+        const uint8_t chId   = st.activeChannelId();
+        const uint8_t dualCh = st.doubleChannel() & 0x03;
+        out[0] = (1u << 7)                        // is_power_on
+               | ((inTx ? 1u : 0u) << 6)
+               | ((sqOpen ? 1u : 0u) << 5)        // is_sq
+               | ((sqOpen ? 1u : 0u) << 4)        // is_in_rx
+               | (dualCh << 2)                    // double_channel (VFO actif)
+               | ((st.scan() ? 1u : 0u) << 1);    // is_scan
+        out[1] = ((chId & 0x0F) << 4)             // curr_ch_id[3:0]
+               | ((aocConn ? 1u : 0u) << 1);      // is_aoc_connected
+        out[2] = ((rssi & 0x0F) << 4)             // rssi
+               | ((region >> 2) & 0x0F);          // curr_region[5:2]
+        out[3] = ((region & 0x03) << 6)           // curr_region[1:0]
+               | (((chId >> 4) & 0x0F) << 2);     // curr_ch_id[7:4]
+    }
+
+    // GET_HT_STATUS : [status][4 octets StatusExt].
+    inline std::vector<uint8_t> htStatus(const RadioState& st, bool inTx, bool sqOpen,
+                                         uint8_t rssi = 0, bool aocConn = false) {
         std::vector<uint8_t> b(1 + 4, 0);
         b[0] = ReplyStatus::SUCCESS;
-        b[1] = (1u << 7)                       // is_power_on
-             | ((inTx ? 1u : 0u) << 6)
-             | ((sqOpen ? 1u : 0u) << 5)       // is_sq
-             | ((sqOpen ? 1u : 0u) << 4)       // is_in_rx
-             | (dualCh << 2)                   // double_channel (VFO actif)
-             | ((st.scan() ? 1u : 0u) << 1);   // is_scan
-        b[2] = ((chId & 0x0F) << 4);           // curr_ch_id[3:0] ; flags conn = 0
-        b[3] = ((0u & 0x0F) << 4)              // rssi = 0
-             | ((region >> 2) & 0x0F);         // curr_region[5:2]
-        b[4] = ((region & 0x03) << 6)          // curr_region[1:0]
-             | (((chId >> 4) & 0x0F) << 2);    // curr_ch_id[7:4]
+        packHtStatus(st, inTx, sqOpen, rssi, aocConn, &b[1]);
+        return b;
+    }
+
+    // EVENT_NOTIFICATION / HT_STATUS_CHANGED : [type=1][4 octets StatusExt].
+    // Pas d'octet de statut : le corps colle a ce qu'emet la vraie VR-N76
+    // (FF 01 00 05 00 02 00 09 01 XX XX XX XX).
+    inline std::vector<uint8_t> htStatusChangedEvent(const RadioState& st, bool inTx,
+                                                     bool sqOpen, uint8_t rssi, bool aocConn) {
+        std::vector<uint8_t> b(1 + 4, 0);
+        b[0] = EventType::HT_STATUS_CHANGED;
+        packHtStatus(st, inTx, sqOpen, rssi, aocConn, &b[1]);
         return b;
     }
 

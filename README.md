@@ -7,10 +7,15 @@
 > des canaux mémoire avec persistance en mémoire flash (NVS), sélection du
 > VFO / canal actif, région.
 >
-> Ce qui **ne fonctionne pas encore** : l'audio (le transport RFCOMM est en
-> place et compatible, mais le codec SBC 32 kHz et le pipeline I2S ne sont
-> pas implémentés — aucun son ne transite pour l'instant). Le mode VFO
-> fréquence libre n'est pas géré. Développé sans matériel de test I2S.
+> Audio : **implémenté mais non validé sur matériel.** Le codec SBC 32 kHz
+> (encodeur + décodeur de `libbt.a`), le framing du canal audio, le pont vers
+> le **DAC et l'ADC internes** de l'ESP32 et les notifications de statut
+> (`HT_STATUS_CHANGED` : squelch / S-mètre pendant la réception) sont en
+> place. Il reste à régler à l'oreille le mode ADC+DAC interne simultané et à
+> câbler l'étage analogique (voir « Audio » plus bas). Développé sans matériel
+> de test.
+>
+> Ce qui **ne fonctionne pas encore** : le mode VFO fréquence libre.
 >
 > Utilisez-le pour l'interopérabilité Bluetooth / le test de HTCommander,
 > pas comme une vraie radio. Retours et contributions bienvenus.
@@ -77,6 +82,14 @@ plus compilé par défaut.
   une fois, ou `pio run -t erase`.
 - **Bit-packing MSB-first** générique (`BitStream.h`) pour les structures
   type `RfCh`/`Settings`/`DevInfo`.
+- **Notifications non sollicitées** (`BenshiCommandHandler.h`) :
+  `EVENT_NOTIFICATION / HT_STATUS_CHANGED` poussé sur le canal commande après
+  chaque écriture, et pendant la réception audio (`is_sq` / `is_in_rx` + RSSI
+  0-15 dérivé du niveau du PCM décodé). Byte-pour-byte identique à ce
+  qu'émet une vraie VR-N76. Respecte `REGISTER_NOTIFICATION`.
+- **Pont audio** (`AudioBridge.h` + `SbcCodec.h`) : canal RFCOMM audio ↔ DAC /
+  ADC internes de l'ESP32, codec SBC réutilisé depuis `libbt.a` (voir
+  [`docs/AudioProtocol.md`](docs/AudioProtocol.md)).
 
 ## Détection par HTCommander — d'après son code source
 
@@ -158,14 +171,40 @@ entre deux fenêtres de scan et il faut parfois relancer la découverte
 plusieurs fois. Pense aussi à **éteindre la vraie VR-N76** pendant les tests
 (même nom Bluetooth → confusion possible).
 
-## Le codec audio (SBC) — non réimplémenté
+## Audio — pont Bluetooth ↔ DAC / ADC internes
 
-Le protocole encode l'audio en SBC 32 kHz (même codec que l'A2DP). Écrire un
-codec SBC complet dépasse le cadre de ce squelette. Solution recommandée :
-réutiliser le codec SBC embarqué dans la lib `pschatzmann/ESP32-A2DP`
-(`oi_codec_sbc`, réutilisable même hors A2DP), branché sur les points
-d'accroche marqués `TODO` dans `DualRfcommServers.h`, avec une paire de bus
-I2S (broches définies dans `config.h`).
+Le canal RFCOMM audio transporte du **SBC 32 kHz / 16 bits / mono** (mono,
+8 sous-bandes, 16 blocs, allocation *loudness*, bitpool 40 — paramètres
+confirmés depuis le code de HTCommander). Le firmware :
+
+- **décode / encode le SBC** en réutilisant l'encodeur (`SBC_Encoder`) et le
+  décodeur (`OI_CODEC_SBC_DecodeFrame`) **déjà présents dans `libbt.a`** ;
+  seuls les en-têtes sont vendorisés dans [`lib/sbc/`](lib/sbc/) — aucune
+  dépendance ajoutée (même approche que `VendorSdpRecord.h` pour le SDP) ;
+- fait transiter le PCM via le **DAC et l'ADC internes** de l'ESP32, pilotés
+  par l'unique I2S0 en mode « built-in ADC + DAC » full-duplex
+  (`AudioBridge.h`, calqué sur l'exemple ESP-IDF `i2s_adc_dac`).
+
+### Brochage (GPIO)
+
+| Fonction | GPIO | Détail |
+|---|---|---|
+| **Sortie DAC** — haut-parleur (réception) | **GPIO25** (DAC1) *et* **GPIO26** (DAC2) | Mode « built-in DAC » : l'I2S pilote les deux broches. Brancher l'ampli sur **GPIO25**. Sortie 0–3,3 V 8 bits → **ampli externe indispensable** (PAM8302 / LM386). |
+| **Entrée ADC** — micro (émission) | **GPIO34** (`ADC1_CH6`) | `AUDIO_ADC_CHANNEL` dans `config.h` (0=GPIO36 … 6=GPIO34 7=GPIO35, **ADC1 uniquement** — ADC2 entre en conflit radio). Prévoir un **micro électret + préampli polarisé vers ~1,65 V** (VDD/2). |
+| **PTT** (déclenche l'émission micro) | **désactivé** (`AUDIO_PTT_GPIO = -1`) | Mettre un numéro de GPIO pour activer : broche tirée à la masse = émission. Tant que `-1`, le micro reste muet et seule la réception est active. |
+
+Tout est configurable dans la **section 5 de [`src/config.h`](src/config.h)**
+(`AUDIO_DAC_ENABLE`, `AUDIO_ADC_ENABLE`, `AUDIO_ADC_CHANNEL`, `AUDIO_PTT_GPIO`,
+`AUDIO_SPK_VOLUME`, `AUDIO_MIC_GAIN`, `AUDIO_SBC_BITPOOL`…). Poser
+`AUDIO_BRIDGE_ENABLE` à `false` compile un firmware « commandes seules » sans
+aucun accès I2S / DAC / ADC.
+
+### À valider sur matériel
+
+Le mode ADC + DAC internes **simultané** de l'ESP32 (un seul I2S0) est
+notoirement bruyant et sensible au format d'échantillon. La chaîne
+SBC + framing + files d'attente est en revanche indépendante du matériel.
+Détails et pistes de réglage : [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
 
 ## MAC Bluetooth
 

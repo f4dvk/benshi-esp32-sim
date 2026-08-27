@@ -10,6 +10,7 @@
 #include "GaiaFrame.h"
 #include "BenshiCommandHandler.h"
 #include "VendorSdpRecord.h"
+#include "AudioBridge.h"
 
 // ============================================================================
 // MODULE LE PLUS EXPERIMENTAL DE CE PROJET - NON TESTE SUR MATERIEL REEL.
@@ -131,14 +132,36 @@ public:
                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         }
         Serial.println("[SPP-DUAL] Init lancee, attente de ESP_SPP_INIT_EVT...");
+
+        // 5) Notifications non sollicitees (EVENT_NOTIFICATION) sur le canal
+        //    commande : statut apres ecriture, squelch/RSSI pendant la reception.
+        handler_.onNotify([this](const BenshiMessage& m) { sendCommandReply(m); });
+
+        // 6) Pont audio SBC <-> DAC/ADC internes. L'encodeur micro envoie ses
+        //    trames sur le canal RFCOMM audio via sendAudioData()/sendAudioEnd().
+        audio_.onTxFrame([this](const uint8_t* sbc, size_t len) { sendAudioData(sbc, len); });
+        audio_.onTxEnd([this]() { sendAudioEnd(); });
+        // Niveau de reception -> is_sq / is_in_rx / rssi de la trame de statut.
+        audio_.onRxLevel([this](bool active, uint8_t rssi) {
+            handler_.setAudioRx(active, rssi);
+        });
+        if (!audio_.begin()) {
+            Serial.println("[SPP-DUAL] AVERTISSEMENT: pont audio non demarre (commandes OK).");
+        }
         return true;
     }
 
     void sendAudioData(const uint8_t* sbcPayload, size_t len) {
         if (audioHandle_ == 0) return;
         std::vector<uint8_t> frame;
-        frame.push_back(0x00);
+        frame.push_back(0x00);               // Type = AudioData
         frame.insert(frame.end(), sbcPayload, sbcPayload + len);
+        writeFramedAudio(frame);
+    }
+
+    void sendAudioEnd() {
+        if (audioHandle_ == 0) return;
+        std::vector<uint8_t> frame = { 0x01 };   // Type = AudioEnd
         writeFramedAudio(frame);
     }
 
@@ -290,7 +313,11 @@ private:
 
             case ESP_SPP_CLOSE_EVT:
                 if (param->close.handle == cmdHandle_)   { cmdHandle_ = 0;   cmdRxBuf_.clear(); }
-                if (param->close.handle == audioHandle_) { audioHandle_ = 0; audioRxFrame_.clear(); }
+                if (param->close.handle == audioHandle_) {
+                    audioHandle_ = 0; audioRxFrame_.clear();
+                    handler_.setAudioConnected(false);
+                    handler_.setAudioRx(false, 0);
+                }
                 if (param->close.handle == pendingConn_) { pendingConn_ = 0; pendingListen_ = 0; }
                 Serial.println("[SPP-DUAL] Deconnexion d'un canal RFCOMM");
                 break;
@@ -339,6 +366,7 @@ private:
             Serial.println("[SPP-DUAL] -> canal COMMANDE");
         } else if (role == ROLE_AUDIO) {
             audioHandle_ = handle;
+            handler_.setAudioConnected(true);
             Serial.println("[SPP-DUAL] -> canal AUDIO");
         }
     }
@@ -408,6 +436,9 @@ private:
                 BenshiMessage out;
                 if (handler_.process(in, out)) {
                     sendCommandReply(out);
+                    // Notification(s) de statut declenchee(s) par une ecriture,
+                    // emise(s) APRES la reponse (ordre observe sur la vraie radio).
+                    handler_.flushPendingNotifications();
                 }
             }
         }
@@ -431,11 +462,22 @@ private:
     void dispatchAudioFrame(const std::vector<uint8_t>& frame) {
         if (frame.empty()) return;
         uint8_t type = frame[0];
-        if (type == 0x00) {
-            Serial.printf("[SPP-DUAL] AudioData recu (%u octets SBC)\n", (unsigned)(frame.size() - 1));
-            // TODO: decoder le SBC ici (voir AudioRfcomm.h pour le detail)
-        } else if (type == 0x01) {
-            Serial.println("[SPP-DUAL] AudioEnd recu");
+        const uint8_t* payload = frame.data() + 1;
+        size_t         plen    = frame.size() - 1;
+        switch (type) {
+            case 0x00:   // AudioData (numerotation "impaire" cote HTCommander)
+            case 0x03:   // AudioData
+                audio_.pushRadioSbc(payload, plen);
+                break;
+            case 0x01:   // AudioEnd
+                audio_.radioAudioEnd();
+                break;
+            case 0x02:   // AudioAck
+                break;
+            default:
+                Serial.printf("[SPP-DUAL] Trame audio type 0x%02X ignoree (%u octets)\n",
+                              type, (unsigned)plen);
+                break;
         }
     }
 
@@ -458,6 +500,7 @@ private:
     std::vector<uint8_t> audioRxFrame_;
     bool audioEscapeNext_ = false;
     BenshiCommandHandler handler_;
+    AudioBridge audio_;
 };
 
 inline DualRfcommServers* DualRfcommServers::instance_ = nullptr;

@@ -1,0 +1,9 @@
+{
+  "name": "sbc-bluedroid-headers",
+  "version": "0.0.0",
+  "description": "En-tetes du codec SBC de Bluedroid, pour appeler les symboles SBC deja presents dans libbt.a (aucun .c ajoute).",
+  "build": {
+    "flags": ["-I include"],
+    "libArchive": false
+  }
+}

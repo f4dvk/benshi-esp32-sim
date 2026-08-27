@@ -153,14 +153,42 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define USE_DUAL_RFCOMM_SERVERS true
 
 // ----------------------------------------------------------------------
-// 5) Audio
+// 5) Audio - pont Bluetooth <-> DAC / ADC internes de l'ESP32
 // ----------------------------------------------------------------------
-#define AUDIO_SAMPLE_RATE_HZ   32000   // imposé par le protocole (SBC 32kHz)
-// Brochage I2S pour un codec/mic I2S externe (INMP441 en entrée,
-// MAX98357A en sortie, par ex.) - à adapter à ton câblage réel.
-#define I2S_MIC_BCLK   26
-#define I2S_MIC_WS     25
-#define I2S_MIC_DATA   33
-#define I2S_SPK_BCLK   27
-#define I2S_SPK_WS     14
-#define I2S_SPK_DATA   12
+// Le canal RFCOMM audio transporte du SBC. Paramètres confirmés depuis le
+// code source de HTCommander (src/lib/radio/audio_engine.dart) :
+//   PCM  : 32 kHz, 16 bits, mono
+//   SBC  : mono, 8 sous-bandes, 16 blocs, allocation "loudness", bitpool 40
+//   1 trame SBC = 128 échantillons PCM (256 octets) -> ~88 octets SBC
+// Framing sur le canal : délimiteurs 0x7E, échappement 0x7D (octet XOR 0x20).
+// Types de trame (1er octet) : 0x00/0x03 = audio, 0x01 = fin, 0x02 = ACK.
+#define AUDIO_SAMPLE_RATE_HZ   32000
+#define AUDIO_SBC_BITPOOL      40
+
+// Le pont audio (AudioBridge.h) n'est actif qu'avec les 2 serveurs RFCOMM.
+// Mets à false pour compiler un firmware "commandes seules" (aucun I2S/DAC/ADC).
+#define AUDIO_BRIDGE_ENABLE    true
+
+// --- Sortie "haut-parleur" : DAC interne, piloté par l'I2S en mode
+//     "built-in DAC" (DMA). En interne l'ESP32 pilote les DEUX broches DAC :
+//       GPIO25 = DAC1  (canal droit)   <- branche l'ampli ici
+//       GPIO26 = DAC2  (canal gauche)
+//     Sortie 0..3,3 V sur 8 bits : un petit ampli (PAM8302 / LM386) est
+//     indispensable, une sortie casque directe est trop faible.
+#define AUDIO_DAC_ENABLE       true
+#define AUDIO_SPK_VOLUME       0.80f    // 0..1, atténuation numérique avant le DAC
+
+// --- Entrée "micro" : ADC1 interne, lu par le même I2S en mode
+//     "built-in ADC" (DMA). ADC1 uniquement (ADC2 entre en conflit radio).
+//     Canaux ADC1 : 0=GPIO36 1=GPIO37 2=GPIO38 3=GPIO39 4=GPIO32 5=GPIO33
+//                   6=GPIO34 7=GPIO35
+//     Prévois un micro électret + préampli polarisé autour de 1,65 V (VDD/2).
+#define AUDIO_ADC_ENABLE       true
+#define AUDIO_ADC_CHANNEL      6        // GPIO34
+#define AUDIO_MIC_GAIN         8.0f     // gain numérique appliqué au PCM capté
+#define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais) du micro
+
+// PTT : quand cette broche passe à la masse, le micro est encodé et envoyé
+// à HTCommander. -1 = pas de bouton -> micro toujours muet (pratique pour
+// tester d'abord le sens réception seul).
+#define AUDIO_PTT_GPIO         -1
