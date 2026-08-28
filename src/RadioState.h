@@ -132,6 +132,12 @@ public:
         return (id < CHANNEL_COUNT) ? id : 0;
     }
 
+    // Nom du canal actif (10 octets max, decode de la struct binaire).
+    String activeChannelName() const { return channelName(activeChannelId()); }
+    String channelNameOf(uint8_t id) const {
+        return (id < CHANNEL_COUNT) ? channelName(id) : String();
+    }
+
     // Parametres RF decodes du canal actif (pour piloter un module SA818).
     struct ActiveRf {
         double  tx_mhz = 0, rx_mhz = 0;   // MHz

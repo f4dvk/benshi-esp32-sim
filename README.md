@@ -17,6 +17,10 @@
 > présenter un peu de bruit de quantification (filtre `AUDIO_DAC_LOWPASS` en
 > option).
 >
+> **TNC AX.25 / APRS** (canal données) : implémenté (`HT_SEND_DATA` / `RX_DATA`
+> + modem AFSK 1200 `dkaukov/esp32-afsk`), actif uniquement sur le canal nommé
+> « APRS ». **Non validé sur matériel.** ⚠️ ce module rend le firmware **GPL-3**.
+>
 > Ce qui **ne fonctionne pas encore** : le mode VFO fréquence libre.
 >
 > Utilisez-le pour l'interopérabilité Bluetooth / le test de HTCommander,

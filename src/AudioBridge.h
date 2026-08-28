@@ -54,6 +54,26 @@ public:
     void onTxState(TxStateFn fn) { txStateCb_ = std::move(fn); }
     void setChannelUp(bool up)   { channelUp_.store(up); }   // canal RFCOMM audio connecté ?
 
+    // --- Mode données (canal APRS) : l'audio ne passe plus par le SBC mais par
+    //     le TNC. L'ADC est routé vers dataRxCb_, le DAC est alimenté par
+    //     dataTxAudio() (sortie du modulateur AFSK).
+    using DataRxFn = std::function<void(const int16_t*, size_t)>;
+    void onDataRxAudio(DataRxFn fn) { dataRxCb_ = std::move(fn); }
+    void setDataMode(bool on)       { dataMode_.store(on); }
+    bool dataMode() const           { return dataMode_.load(); }
+
+    // Poussé par le modulateur AFSK (bloque si la file DAC est pleine -> cadence
+    // la génération sur le temps réel).
+    void dataTxAudio(const int16_t* pcm, size_t n) {
+#if AUDIO_BRIDGE_ENABLE
+        if (!dataTxSb_) return;
+        dataTxLastMs_.store(millis());
+        xStreamBufferSend(dataTxSb_, pcm, n * sizeof(int16_t), pdMS_TO_TICKS(500));
+#endif
+    }
+    void dataTxEnd() { /* le PTT retombe via la traîne dans ctlLoop */ }
+    bool dataTxActive() const { return (millis() - dataTxLastMs_.load()) < 300; }
+
     bool begin() {
 #if !AUDIO_BRIDGE_ENABLE
         Serial.println("[AUDIO] Pont audio desactive (AUDIO_BRIDGE_ENABLE=false)");
@@ -61,6 +81,8 @@ public:
 #else
         sbcIn_ = xStreamBufferCreate(kSbcInBytes, 1);
         if (!sbcIn_) { Serial.println("[AUDIO] ERREUR: stream buffer SBC"); return false; }
+        dataTxSb_ = xStreamBufferCreate(8192, 1);   // ~128 ms de PCM du modulateur AFSK
+        if (!dataTxSb_) { Serial.println("[AUDIO] ERREUR: stream buffer TNC"); return false; }
 
         if (!decoder_.begin()) { Serial.println("[AUDIO] ERREUR: init decodeur SBC"); return false; }
         if (!encoder_.begin(AUDIO_SBC_BITPOOL)) { Serial.println("[AUDIO] ERREUR: init encodeur SBC"); return false; }
@@ -335,16 +357,28 @@ private:
                         adcLevel_.store((uint32_t)adcEnv_);
                         adcSamples_.fetch_add(cnt);
                     }
-                    // Pre-roll : sur le front d'ouverture, on injecte d'abord
-                    // les ~AUDIO_RX_PREROLL_MS captees AVANT (le squelch du
-                    // SA818 s'ouvre apres le preambule d'un paquet APRS).
-                    if (gate && !gatePrev_) preroll_.drainTo(micRing_);
+                    if (dataMode_.load()) {
+                        // Canal APRS : l'ADC va au démodulateur TNC, pas au SBC.
+                        if (dataRxCb_) dataRxCb_(mic, cnt);
+                    } else {
+                        // Pre-roll : sur le front d'ouverture, on injecte d'abord
+                        // les ~AUDIO_RX_PREROLL_MS captées AVANT (le squelch du
+                        // SA818 s'ouvre après le préambule d'un paquet APRS).
+                        if (gate && !gatePrev_) preroll_.drainTo(micRing_);
+                        if (gate) micRing_.write(mic, cnt);
+                        else      preroll_.push(mic, cnt);
+                    }
                     gatePrev_ = gate;
-                    if (gate) micRing_.write(mic, cnt);
-                    else      preroll_.push(mic, cnt);
                 }
             } else if (ioMode_ == IO_TX) {
-                size_t got = playRing_.read(play, kFrame);
+                size_t got;
+                if (dataMode_.load()) {
+                    size_t br = xStreamBufferReceive(dataTxSb_, play,
+                                                     kFrame * sizeof(int16_t), 0);
+                    got = br / sizeof(int16_t);
+                } else {
+                    got = playRing_.read(play, kFrame);
+                }
                 for (size_t i = 0; i < kFrame; i++) {
                     float in = (i < got) ? (play[i] * AUDIO_SPK_VOLUME) : 0.f;
 #if AUDIO_DAC_LOWPASS
@@ -436,8 +470,10 @@ private:
         for (;;) {
             uint32_t now = millis();
 
-            // --- PTT vers le poste : actif tant que HTCommander envoie ---
-            bool tx = (now - lastRadioSbcMs_.load()) < (uint32_t)AUDIO_PTT_TAIL_MS;
+            // --- PTT vers le poste : actif tant que HTCommander envoie de la
+            //     phonie, OU tant que le modulateur TNC produit de l'audio ---
+            bool tx = ((now - lastRadioSbcMs_.load()) < (uint32_t)AUDIO_PTT_TAIL_MS)
+                      || dataTxActive();
             wantTx_.store(tx);                         // pumpLoop bascule I2S0 ADC<->DAC
             if (tx != txPrev) {
                 txPrev = tx;
@@ -529,8 +565,13 @@ private:
     sbc::Encoder encoder_;
 
     StreamBufferHandle_t sbcIn_ = nullptr;
+    StreamBufferHandle_t dataTxSb_ = nullptr;
     PcmRing<kPlayRing> playRing_;
     PcmRing<kMicRing>  micRing_;
+
+    DataRxFn dataRxCb_;
+    std::atomic<bool>     dataMode_{false};
+    std::atomic<uint32_t> dataTxLastMs_{0};
 
     TaskHandle_t pumpTask_ = nullptr, rxTask_ = nullptr, txTask_ = nullptr, ctlTask_ = nullptr;
 

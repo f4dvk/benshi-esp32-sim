@@ -29,8 +29,26 @@ public:
     // transport). Peut être appelé depuis n'importe quelle tâche.
     using NotifSink = std::function<void(const BenshiMessage&)>;
 
+    // Corps brut de HT_SEND_DATA (fragment AX.25 : [flags][data][chanId?]).
+    using DataTxFn = std::function<void(const uint8_t*, size_t)>;
+
     void begin() { state_.begin(); }
     void onNotify(NotifSink sink) { sink_ = std::move(sink); }
+    void onDataTx(DataTxFn f)     { dataTxCb_ = std::move(f); }
+
+    String  activeChannelName() { return state_.activeChannelName(); }
+    uint8_t activeChannelId()   { return state_.activeChannelId(); }
+
+    // Émet une commande NON sollicitée sur le canal commande (ex. RX_DATA).
+    void emitCommand(uint16_t cmd, const uint8_t* body, size_t len) {
+        if (!sink_) return;
+        BenshiMessage m;
+        m.command_group = CommandGroup::BASIC;
+        m.is_reply      = false;
+        m.command       = cmd;
+        m.body.assign(body, body + len);
+        sink_(m);
+    }
 
     // Mode SA818 : module RF réel à piloter (nullptr = mode "UV-K1" simulé).
     void setRfModule(Sa818* rf) { rf_ = rf; }
@@ -151,6 +169,10 @@ public:
             outMsg.body = BenshiReplies::htStatus(state_, inTx_.load(), sqOpen_.load(),
                                                   rssi_.load(), aocConnected_.load());
 
+        } else if (in.command == HT_SEND_DATA) {
+            if (dataTxCb_) dataTxCb_(in.body.data(), in.body.size());
+            outMsg.body = { ReplyStatus::SUCCESS };   // accusé -> HTCommander envoie le fragment suivant
+
         } else if (in.command == GET_VOLUME) {
             outMsg.body = { ReplyStatus::SUCCESS, volume_ };
 
@@ -217,6 +239,7 @@ public:
 private:
     RadioState state_;
     NotifSink  sink_;
+    DataTxFn   dataTxCb_;
     Sa818*     rf_ = nullptr;
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré

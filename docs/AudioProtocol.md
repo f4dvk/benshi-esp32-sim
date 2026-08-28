@@ -150,5 +150,25 @@ pendant que la tâche Bluetooth peut l'écrire (`WRITE_*`). Lecture potentiellem
   logiciel 1 pôle) ou sortie PDM + filtre RC (comme kv4p-ht) pour faire mieux.
 - Le type de trame audio *venant* de la radio est `0x00` (confirmé : HTCommander
   décode `0x00` et `0x03` de la même façon).
-- **APRS fiable** = canal données Benshi (`HT_SEND_DATA` / `RX_DATA`, cmd 31/57,
-  trames AX.25 hors audio/SBC) — non implémenté.
+## Canal données / TNC AX.25 (APRS fiable)
+
+Quand la radio est sur le canal nommé `TNC_CHANNEL_NAME` (« APRS »), l'ESP fait
+**TNC matériel** au lieu de passer l'APRS par l'audio SBC :
+
+- **TX** : `HT_SEND_DATA` (cmd 31, corps `[flags][ax25…][chanId?]`, flags =
+  bit7 final · bit6 hasChanId · bits[5:0] fragId) → réassemblage →
+  `AfskModulator` → PCM → DAC → PTT poste. On accuse chaque fragment
+  (`{is_reply, cmd 31, [0x00]}`) pour que HTCommander envoie le suivant.
+- **RX** : ADC → `AfskDemodulator` (bandpass → I/Q → FM demod → PLL → NRZI →
+  HDLC → CRC) → trame AX.25 (FCS vérifié + retiré) → **`RX_DATA` (cmd 57)**
+  non sollicité, fragmenté à 180 o : `[0x00][flags][ax25][chanId]`.
+- Modem : `dkaukov/esp32-afsk` (mêmes libs que kv4p-ht, **GPL-3**), `esp-dsp`
+  déjà fourni par arduino-esp32. `-DAFSK_SAMPLE_RATE=32000`.
+- Hors canal APRS : `dataChanActive_` = false → pont audio en phonie SBC normal.
+- Tâches : `tnc_rx` (démod), `tnc_tx` (modulation, bloquante = temps réel).
+
+Côté HTCommander : **mettre le modem logiciel APRS sur « Off »** (sinon il
+module/démodule lui-même via l'audio au lieu d'utiliser notre TNC). Le modem
+matériel (`hardwareModemEnabled`) est actif par défaut.
+
+Non validé sur matériel au moment de l'écriture.

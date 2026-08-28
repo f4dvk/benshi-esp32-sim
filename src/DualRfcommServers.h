@@ -12,6 +12,8 @@
 #include "BenshiCommandHandler.h"
 #include "VendorSdpRecord.h"
 #include "AudioBridge.h"
+#include "TncModem.h"
+#include "freertos/stream_buffer.h"
 
 // ============================================================================
 // MODULE LE PLUS EXPERIMENTAL DE CE PROJET - NON TESTE SUR MATERIEL REEL.
@@ -166,6 +168,12 @@ public:
             rf_->setVolume(RF_MODULE_VOLUME);
             handler_.syncRf();                      // fait aussi tune + filtres + puissance
         }
+
+#if TNC_ENABLE
+        // 8) TNC AX.25 / AFSK 1200 pour le canal donnees "APRS".
+        tncSetup();
+        tncUpdateChannel();
+#endif
         return true;
     }
 
@@ -184,6 +192,9 @@ public:
     void poll() {
         handler_.pollRf();
         flushAudioCoalesce();
+#if TNC_ENABLE
+        tncUpdateChannel();
+#endif
 
         // Filet de securite : HTCommander a ouvert un 2e canal RFCOMM mais
         // n'y a encore rien envoye -> aucun mapping. Le canal COMMANDE est deja
@@ -208,14 +219,19 @@ public:
                 "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz clip=%lu | "
                 "RX<-HTC: cmd=%u audioData=%uf/%uo types=0x%03X | "
                 "mic: enc=%u SBC/s -> spp chunks sent=%u drop~=%u qlen=%u | "
-                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu\n",
+                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu%s\n",
                 (unsigned long)cmdHandle_, (unsigned long)audioHandle_,
                 (unsigned long)pendingConn_, (int)audioCong_,
                 audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps, (unsigned long)clip,
                 dbgCmdFrames_, dbgAudioFrames_, dbgAudioBytes_, dbgAudioTypes_,
                 enc, dbgAudioSent_, dbgAudioDrop_, (unsigned)audioTxQ_.size(),
                 (int)audio_.txToRadio(), (int)audio_.squelchRaw(),
-                (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel());
+                (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel(),
+#if TNC_ENABLE
+                dataChanActive_ ? " | TNC=DATA(AFSK)" : "");
+#else
+                "");
+#endif
             dbgCmdFrames_ = dbgAudioFrames_ = dbgAudioBytes_ = 0;
             dbgAudioSent_ = dbgAudioDrop_ = 0;
             dbgAudioTypes_ = 0;
@@ -696,6 +712,126 @@ private:
     BenshiCommandHandler handler_;
     AudioBridge audio_;
     Sa818* rf_ = nullptr;
+
+#if TNC_ENABLE
+    // --- TNC AX.25 / AFSK 1200 (canal APRS) -------------------------------
+    TncModem tnc_;
+    bool dataChanActive_ = false;                // radio sur le canal "APRS"
+    std::vector<uint8_t> tncTxAccum_;            // réassemblage HT_SEND_DATA
+    int      tncTxNextFrag_ = 0;
+    StreamBufferHandle_t tncTxQ_ = nullptr;      // trames AX.25 completes -> tache TX
+    StreamBufferHandle_t tncRxSb_ = nullptr;     // PCM ADC -> tache demod
+
+    bool tncOn() const { return dataChanActive_; }
+
+    void tncSetup() {
+        tncTxQ_  = xStreamBufferCreate(2048, 1);
+        tncRxSb_ = xStreamBufferCreate(8192, 1);
+        if (!tnc_.begin()) { Serial.println("[TNC] init modem AFSK KO"); return; }
+        tnc_.onRxFrame([this](const uint8_t* ax25, size_t len) { onTncRxFrame(ax25, len); });
+        tnc_.onTxAudio([this](const int16_t* pcm, size_t n)   { audio_.dataTxAudio(pcm, n); });
+        tnc_.onTxDone([this]() { audio_.dataTxEnd(); });
+        // La pompe I2S (temps réel) ne fait que déposer le PCM ; le démodulateur
+        // (FIR, coûteux) tourne dans sa propre tâche.
+        audio_.onDataRxAudio([this](const int16_t* pcm, size_t n) {
+            if (dataChanActive_ && tncRxSb_)
+                xStreamBufferSend(tncRxSb_, pcm, n * sizeof(int16_t), 0);
+        });
+        handler_.onDataTx([this](const uint8_t* body, size_t len) { onHtSendData(body, len); });
+        xTaskCreatePinnedToCore(&DualRfcommServers::tncTxTrampoline, "tnc_tx",
+                                8192, this, 4, nullptr, 1);
+        xTaskCreatePinnedToCore(&DualRfcommServers::tncRxTrampoline, "tnc_rx",
+                                8192, this, 5, nullptr, 1);
+        Serial.printf("[TNC] pret ; actif sur le canal \"%s\"\n", TNC_CHANNEL_NAME);
+    }
+
+    static void tncRxTrampoline(void* self) { static_cast<DualRfcommServers*>(self)->tncRxLoop(); }
+    void tncRxLoop() {
+        int16_t pcm[256];
+        for (;;) {
+            size_t br = xStreamBufferReceive(tncRxSb_, pcm, sizeof(pcm), pdMS_TO_TICKS(100));
+            if (br >= sizeof(int16_t)) tnc_.feedRxAudio(pcm, br / sizeof(int16_t));
+        }
+    }
+
+    // Suit le canal actif : bascule le pont audio en mode données sur "APRS".
+    void tncUpdateChannel() {
+        bool on = handler_.activeChannelName() == String(TNC_CHANNEL_NAME);
+        if (on == dataChanActive_) return;
+        dataChanActive_ = on;
+        audio_.setDataMode(on);
+        Serial.printf("[TNC] canal \"%s\" %s -> %s\n", TNC_CHANNEL_NAME,
+                      on ? "actif" : "quitte",
+                      on ? "mode DONNEES (AFSK)" : "mode PHONIE (SBC)");
+    }
+
+    // HT_SEND_DATA : [flags][ax25 fragment][chanId?]. On réassemble puis on
+    // pousse la trame complète à la tâche de modulation.
+    void onHtSendData(const uint8_t* body, size_t len) {
+        if (!len) return;
+        uint8_t flags = body[0];
+        bool    isFinal = flags & 0x80;
+        bool    hasChan = flags & 0x40;
+        uint8_t fragId  = flags & 0x3F;
+        size_t  dataLen = len - 1 - (hasChan ? 1 : 0);
+        const uint8_t* data = body + 1;
+
+        if (fragId == 0) { tncTxAccum_.clear(); tncTxNextFrag_ = 0; }
+        if ((int)fragId != tncTxNextFrag_) { tncTxAccum_.clear(); return; }   // désynchro
+        tncTxAccum_.insert(tncTxAccum_.end(), data, data + dataLen);
+        tncTxNextFrag_++;
+
+        if (isFinal && !tncTxAccum_.empty()) {
+            uint16_t n = (uint16_t)tncTxAccum_.size();
+            xStreamBufferSend(tncTxQ_, &n, sizeof(n), 0);
+            xStreamBufferSend(tncTxQ_, tncTxAccum_.data(), n, 0);
+            tncTxAccum_.clear();
+            tncTxNextFrag_ = 0;
+        }
+    }
+
+    static void tncTxTrampoline(void* self) { static_cast<DualRfcommServers*>(self)->tncTxLoop(); }
+    void tncTxLoop() {
+        uint8_t frame[512];
+        for (;;) {
+            uint16_t n = 0;
+            if (xStreamBufferReceive(tncTxQ_, &n, sizeof(n), portMAX_DELAY) != sizeof(n)) continue;
+            if (n == 0 || n > sizeof(frame)) continue;
+            size_t got = 0;
+            while (got < n) {
+                got += xStreamBufferReceive(tncTxQ_, frame + got, n - got, pdMS_TO_TICKS(500));
+            }
+            Serial.printf("[TNC] TX trame AX.25 %u octets -> AFSK\n", n);
+            handler_.setAudioTx(true);
+            tnc_.txAx25(frame, n);           // modulate() bloque = temps réel
+            vTaskDelay(pdMS_TO_TICKS(120));  // laisse la traîne DAC/PTT finir
+            handler_.setAudioTx(false);
+        }
+    }
+
+    // Trame AX.25 reçue (FCS déjà vérifié/retiré) -> RX_DATA vers HTCommander,
+    // fragmentée si > MTU. Format fragment : [0x00][flags][data][chanId].
+    void onTncRxFrame(const uint8_t* ax25, size_t len) {
+        Serial.printf("[TNC] RX trame AX.25 %u octets -> HTCommander\n", (unsigned)len);
+        const size_t kMtu = 180;
+        uint8_t chId = handler_.activeChannelId();
+        size_t off = 0;
+        uint8_t fragId = 0;
+        while (off < len) {
+            size_t chunk = (len - off) < kMtu ? (len - off) : kMtu;
+            bool last = (off + chunk) >= len;
+            std::vector<uint8_t> b;
+            b.reserve(3 + chunk);
+            b.push_back(0x00);                                   // octet 4 (ignoré)
+            b.push_back((last ? 0x80 : 0x00) | 0x40 | (fragId & 0x3F));  // flags + hasChanId
+            b.insert(b.end(), ax25 + off, ax25 + off + chunk);
+            b.push_back(chId);
+            handler_.emitCommand(BasicCommand::RX_DATA, b.data(), b.size());
+            off += chunk;
+            fragId++;
+        }
+    }
+#endif  // TNC_ENABLE
 
     // File d'emission audio (esp_spp_write CB : 1 seule ecriture en vol).
     SemaphoreHandle_t audioMtx_ = nullptr;

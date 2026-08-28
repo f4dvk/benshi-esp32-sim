@@ -31,6 +31,7 @@ namespace BasicCommand {
     static const uint16_t GET_VOLUME              = 22;
     static const uint16_t SET_VOLUME              = 23;
     static const uint16_t HT_SEND_DATA            = 31;
+    static const uint16_t RX_DATA                 = 57;
     static const uint16_t READ_BSS_SETTINGS       = 33;
     static const uint16_t WRITE_BSS_SETTINGS      = 34;
     static const uint16_t SET_PHONE_STATUS        = 51;

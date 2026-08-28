@@ -323,6 +323,19 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //   - puissance haute / basse                (broche H/L)       -> bit tx_at_max_power (si RF_MODULE_HL_GPIO)
 
 // ----------------------------------------------------------------------
+// 7bis) TNC AX.25 / AFSK 1200 (canal données APRS)
+// ----------------------------------------------------------------------
+// Quand la radio est sur le canal nommé TNC_CHANNEL_NAME, l'ESP fait TNC :
+//   - HT_SEND_DATA (HTCommander) -> trame AX.25 -> modulation AFSK1200 -> PTT
+//     poste -> audio par le DAC.
+//   - audio du poste -> démodulation AFSK1200 -> trame AX.25 -> notification
+//     dataRxd vers HTCommander.
+// Hors de ce canal, le pont audio reste en phonie (SBC).
+// Dépend de dkaukov/esp32-afsk (GPL-3). false = pas de TNC, pas de dépendance.
+#define TNC_ENABLE            true
+#define TNC_CHANNEL_NAME      "APRS"
+
+// ----------------------------------------------------------------------
 // 7) Traces de mise au point
 // ----------------------------------------------------------------------
 // true -> le firmware imprime périodiquement (1 s) l'état du pont audio :
