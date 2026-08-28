@@ -207,7 +207,7 @@ public:
         w.writeBits(1, 1);                                 // tx_at_max_power
         w.writeBits(0, 1);                                 // talk_around
         w.writeBits(c.bandwidth == BW_WIDE ? 1 : 0, 1);    // bandwidth (1 = wide)
-        w.writeBits(0, 1);                                 // pre_de_emph_bypass
+        w.writeBits(c.emph_bypass ? 1 : 0, 1);             // pre_de_emph_bypass
         w.writeBits(0, 1);                                 // sign
         w.writeBits(0, 1);                                 // tx_at_med_power
         w.writeBits(c.tx_disable ? 1 : 0, 1);              // tx_disable

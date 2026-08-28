@@ -8,7 +8,7 @@ TncModem* TncModem::self_ = nullptr;
 bool TncModem::begin() {
     self_ = this;
     if (!demod_) demod_ = new (std::nothrow)
-        AfskDemodulator(AFSK_SAMPLE_RATE, 4, &TncModem::demodTrampoline);
+        AfskDemodulator(AFSK_SAMPLE_RATE, 2, &TncModem::demodTrampoline);  // décim. 2 comme kv4p-ht
     if (!mod_)   mod_   = new (std::nothrow)
         AfskModulator(AFSK_SAMPLE_RATE, &TncModem::modTrampoline);
     return demod_ && mod_;

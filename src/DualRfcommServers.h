@@ -6,7 +6,6 @@
 #include <esp_bt_device.h>
 #include <esp_gap_bt_api.h>
 #include <vector>
-#include <deque>
 #include "config.h"
 #include "GaiaFrame.h"
 #include "BenshiCommandHandler.h"
@@ -53,8 +52,8 @@ public:
         instance_ = this;
         handler_.setRfModule(rf);
         rf_ = rf;
-        if (!audioMtx_) audioMtx_ = xSemaphoreCreateMutex();
-        audioCoalesce_.reserve(kAudioChunkBytes + 128);
+        if (!audioMtx_)  audioMtx_  = xSemaphoreCreateMutex();
+        if (!audioTxSb_) audioTxSb_ = xStreamBufferCreate(kAudioSbBytes, 1);
 
         // 0) Etat runtime de la radio (canaux / reglages / region), charge
         //    depuis la NVS ou, a defaut, depuis config.h.
@@ -196,6 +195,20 @@ public:
         tncReconcile();
 #endif
 
+        // Filet de securite (reconnexion) : une connexion est en attente depuis
+        // longtemps et AUCUN canal n'est encore mappe. Sur reconnexion, le
+        // START_EVT du serveur (deja demarre) ne se represente pas toujours ->
+        // le mapping par scn reste bloque. HTCommander ouvre TOUJOURS le canal
+        // COMMANDE en premier -> on le force.
+        if (cmdHandle_ == 0 && audioHandle_ == 0 && pendingConn_ != 0 &&
+            millis() - pendingSinceMs_ > 1500) {
+            Serial.printf("[SPP-DUAL] mapping COMMANDE force (handle=%lu, reconnexion)\n",
+                          (unsigned long)pendingConn_);
+            assignRole(pendingConn_, ROLE_CMD);
+            pendingConn_ = 0;
+            pendingListen_ = 0;
+        }
+
         // Filet de securite : HTCommander a ouvert un 2e canal RFCOMM mais
         // n'y a encore rien envoye -> aucun mapping. Le canal COMMANDE est deja
         // identifie -> ce 2e canal ne peut etre que l'AUDIO.
@@ -218,16 +231,17 @@ public:
             Serial.printf(
                 "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz clip=%lu | "
                 "RX<-HTC: cmd=%u audioData=%uf/%uo types=0x%03X | "
-                "mic: enc=%u SBC/s -> spp chunks sent=%u drop~=%u qlen=%u | "
-                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu heap=%u%s\n",
+                "mic: enc=%u SBC/s -> spp w=%u drop=%u sbuf=%uo | "
+                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu agc=x%.1f heap=%u%s\n",
                 (unsigned long)cmdHandle_, (unsigned long)audioHandle_,
                 (unsigned long)pendingConn_, (int)audioCong_,
                 audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps, (unsigned long)clip,
                 dbgCmdFrames_, dbgAudioFrames_, dbgAudioBytes_, dbgAudioTypes_,
-                enc, dbgAudioSent_, dbgAudioDrop_, (unsigned)audioTxQ_.size(),
+                enc, dbgAudioSent_, dbgAudioDrop_,
+                (unsigned)(audioTxSb_ ? xStreamBufferBytesAvailable(audioTxSb_) : 0),
                 (int)audio_.txToRadio(), (int)audio_.squelchRaw(),
                 (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel(),
-                (unsigned)ESP.getFreeHeap(),
+                audio_.agcGain(), (unsigned)ESP.getFreeHeap(),
 #if TNC_ENABLE
                 tncRunning_ ? " | TNC=DATA(AFSK)" : "");
 #else
@@ -241,11 +255,13 @@ public:
     }
 
 private:
-    // ~248 trames SBC/s de ~92 o : envoyees une par une, ca sature RFCOMM
+    // ~248 trames SBC/s de ~92 o : envoyees une par une ca sature RFCOMM
     // (overhead par paquet). On regroupe donc plusieurs trames par
-    // esp_spp_write (HTCommander re-decoupe sur les 0x7E). ~10 chunks en file.
+    // esp_spp_write (HTCommander re-decoupe sur les 0x7E). TOUT est en buffers
+    // FIXES : aucune allocation dans le chemin audio -> pas de std::bad_alloc
+    // quand le heap est serre (TNC + Bluedroid).
     static const size_t kAudioChunkBytes = 512;
-    static const size_t kAudioTxQMax     = 10;
+    static const size_t kAudioSbBytes    = 3072;   // file d'octets vers le SPP
 
     void enqueueAudio(std::vector<uint8_t> payload) {
 #if AUDIO_DEBUG
@@ -254,7 +270,6 @@ private:
             Serial.printf("[AUDIO-TX] 1re trame SBC (%u o) : %02X %02X %02X %02X %02X %02X ...\n",
                           (unsigned)(payload.size() - 1), payload[1], payload[2],
                           payload[3], payload[4], payload[5], payload[6]);
-            Serial.println("           (doit commencer par 9C = syncword SBC)");
         }
 #endif
         if (audioHandle_ == 0) {
@@ -263,65 +278,63 @@ private:
             uint32_t now = millis();
             if (now - dbgNoAudioChanMs_ > 2000) {
                 dbgNoAudioChanMs_ = now;
-                Serial.println("[AUDIO-TX] !! audio a envoyer mais AUCUN canal audio RFCOMM "
-                               "(audioHandle_=0) -> HTCommander n'a pas ouvert le 2e canal");
+                Serial.println("[AUDIO-TX] !! audio a envoyer mais AUCUN canal audio RFCOMM");
             }
 #endif
             return;
         }
         bool isEnd = (!payload.empty() && payload[0] == 0x01);
         lockAudio();
-        appendFramed(audioCoalesce_, payload);
+        appendFramedFixed(payload.data(), payload.size());
         audioCoalesceMs_ = millis();
-        if (audioCoalesce_.size() >= kAudioChunkBytes || isEnd) flushCoalesceLocked();
+        if (coalLen_ >= kAudioChunkBytes || isEnd) flushCoalesceLocked();
         unlockAudio();
         pumpAudioTx();
     }
 
-    // A appeler regulierement (poll) : evite qu'un petit reliquat traine.
-    void flushAudioCoalesce() {
+    void flushAudioCoalesce() {   // depuis poll() : pas de reliquat qui traine
         lockAudio();
-        if (!audioCoalesce_.empty() && millis() - audioCoalesceMs_ > 12) flushCoalesceLocked();
+        if (coalLen_ && millis() - audioCoalesceMs_ > 12) flushCoalesceLocked();
         unlockAudio();
         pumpAudioTx();
     }
 
-    void flushCoalesceLocked() {                 // audioMtx_ deja pris
-        if (audioCoalesce_.empty()) return;
-        if (audioTxQ_.size() >= kAudioTxQMax) { audioTxQ_.pop_front(); dbgAudioDrop_ += 6; }
-        audioTxQ_.push_back(std::move(audioCoalesce_));
-        audioCoalesce_ = std::vector<uint8_t>();
-        audioCoalesce_.reserve(kAudioChunkBytes + 128);
+    void flushCoalesceLocked() {   // audioMtx_ deja pris
+        if (!coalLen_ || !audioTxSb_) { coalLen_ = 0; return; }
+        size_t w = xStreamBufferSend(audioTxSb_, coalBuf_, coalLen_, 0);   // non bloquant
+        if (w < coalLen_) dbgAudioDrop_++;                                 // file pleine -> on jette
+        coalLen_ = 0;
+    }
+
+    void appendFramedFixed(const uint8_t* payload, size_t len) {   // audioMtx_ deja pris
+        auto put = [&](uint8_t b) { if (coalLen_ < sizeof(coalBuf_)) coalBuf_[coalLen_++] = b; };
+        put(0x7E);
+        for (size_t i = 0; i < len; i++) {
+            uint8_t b = payload[i];
+            if (b == 0x7E)      { put(0x7D); put(0x5E); }
+            else if (b == 0x7D) { put(0x7D); put(0x5D); }
+            else                  put(b);
+        }
+        put(0x7E);
     }
 
     void lockAudio()   { if (audioMtx_) xSemaphoreTake(audioMtx_, portMAX_DELAY); }
     void unlockAudio() { if (audioMtx_) xSemaphoreGive(audioMtx_); }
 
-    static void appendFramed(std::vector<uint8_t>& out, const std::vector<uint8_t>& payload) {
-        out.push_back(0x7E);
-        for (uint8_t b : payload) {
-            if (b == 0x7E) { out.push_back(0x7D); out.push_back(0x5E); }
-            else if (b == 0x7D) { out.push_back(0x7D); out.push_back(0x5D); }
-            else out.push_back(b);
-        }
-        out.push_back(0x7E);
-    }
-
-    // esp_spp_write en mode CB : une seule ecriture "en vol", suite au
-    // prochain ESP_SPP_WRITE_EVT (+ respect de la congestion).
+    // esp_spp_write en mode CB : une seule ecriture "en vol" (ESP_SPP_WRITE_EVT)
+    // + respect de la congestion. Buffer d'ecriture FIXE.
     void pumpAudioTx() {
-        std::vector<uint8_t> f;
         lockAudio();
-        if (audioWriteInFlight_ || audioCong_ || audioTxQ_.empty() || audioHandle_ == 0) {
+        if (audioWriteInFlight_ || audioCong_ || audioHandle_ == 0 || !audioTxSb_) {
             unlockAudio();
             return;
         }
-        f = std::move(audioTxQ_.front());
-        audioTxQ_.pop_front();
+        size_t n = xStreamBufferReceive(audioTxSb_, txWriteBuf_, sizeof(txWriteBuf_), 0);
+        if (n == 0) { unlockAudio(); return; }
         audioWriteInFlight_ = true;
         unlockAudio();
 
-        if (esp_spp_write(audioHandle_, f.size(), f.data()) != ESP_OK) {
+        if (esp_spp_write(audioHandle_, n, txWriteBuf_) != ESP_OK) {
             lockAudio();
             audioWriteInFlight_ = false;
             unlockAudio();
@@ -472,8 +485,8 @@ private:
                 if (param->close.handle == audioHandle_) {
                     audioHandle_ = 0; audioRxFrame_.clear();
                     lockAudio();
-                    audioTxQ_.clear();
-                    audioCoalesce_.clear();
+                    if (audioTxSb_) xStreamBufferReset(audioTxSb_);
+                    coalLen_ = 0;
                     audioWriteInFlight_ = false;
                     audioCong_ = false;
                     unlockAudio();
@@ -718,6 +731,7 @@ private:
     // --- TNC AX.25 / AFSK 1200 (canal APRS) -------------------------------
     TncModem tnc_;
     bool dataChanActive_ = false;                // radio sur le canal "APRS"
+    uint32_t connUpSinceMs_ = 0;                 // date où COMMANDE+AUDIO tous deux mappés
     std::vector<uint8_t> tncTxAccum_;            // réassemblage HT_SEND_DATA
     int      tncTxNextFrag_ = 0;
     StreamBufferHandle_t tncTxQ_ = nullptr;      // trames AX.25 completes -> tache TX
@@ -784,16 +798,28 @@ private:
     static void tncRxTrampoline(void* self) { static_cast<DualRfcommServers*>(self)->tncRxLoop(); }
     void tncRxLoop() {
         int16_t pcm[128];
+        uint32_t fed = 0, lastLog = millis();
         while (tncRunning_) {
             size_t br = xStreamBufferReceive(tncRxSb_, pcm, sizeof(pcm), pdMS_TO_TICKS(100));
-            if (br >= sizeof(int16_t) && tncRunning_) tnc_.feedRxAudio(pcm, br / sizeof(int16_t));
+            if (br >= sizeof(int16_t) && tncRunning_) {
+                tnc_.feedRxAudio(pcm, br / sizeof(int16_t));
+                fed += br / sizeof(int16_t);
+            }
+#if AUDIO_DEBUG
+            if (millis() - lastLog >= 2000) {
+                Serial.printf("[TNC] demod : %lu ech/s\n", (unsigned long)(fed / 2));
+                fed = 0; lastLog = millis();
+            }
+#endif
         }
         tncRxTask_ = nullptr;
         vTaskDelete(nullptr);
     }
 
-    // Le TNC ne démarre qu'une fois HTCommander connecté (le canal Bluetooth
-    // doit avoir sa part du heap AVANT le modem AFSK) et sur le canal "APRS".
+    // Le TNC ne démarre qu'une fois HTCommander PLEINEMENT connecté (canaux
+    // COMMANDE **et** AUDIO mappés, puis TNC_START_DELAY_MS de stabilité : le
+    // modem AFSK prend ~15 ko d'un coup et affamerait L2CAP sinon) et sur le
+    // canal "APRS".
     void tncReconcile() {
         bool onAprs = handler_.activeChannelName() == String(TNC_CHANNEL_NAME);
         if (onAprs != dataChanActive_) {
@@ -801,7 +827,12 @@ private:
             Serial.printf("[TNC] canal \"%s\" %s\n", TNC_CHANNEL_NAME,
                           onAprs ? "actif" : "quitte");
         }
-        bool want = dataChanActive_ && (cmdHandle_ != 0);
+        bool bothUp = (cmdHandle_ != 0 && audioHandle_ != 0);
+        if (bothUp && connUpSinceMs_ == 0)  connUpSinceMs_ = millis();
+        if (!bothUp)                        connUpSinceMs_ = 0;
+        bool stable = bothUp &&
+                      (millis() - connUpSinceMs_ >= (uint32_t)TNC_START_DELAY_MS);
+        bool want = dataChanActive_ && stable;
         if (want && !tncRunning_) {
             tncStart();
         } else if (!want && tncRunning_) {
@@ -885,8 +916,10 @@ private:
 
     // File d'emission audio (esp_spp_write CB : 1 seule ecriture en vol).
     SemaphoreHandle_t audioMtx_ = nullptr;
-    std::deque<std::vector<uint8_t>> audioTxQ_;
-    std::vector<uint8_t> audioCoalesce_;
+    StreamBufferHandle_t audioTxSb_ = nullptr;   // octets framés -> SPP (fixe)
+    uint8_t  coalBuf_[700];                      // regroupement (fixe)
+    size_t   coalLen_ = 0;
+    uint8_t  txWriteBuf_[576];                   // buffer d'écriture SPP (fixe)
     uint32_t audioCoalesceMs_ = 0;
     bool audioWriteInFlight_ = false;
     volatile bool audioCong_ = false;

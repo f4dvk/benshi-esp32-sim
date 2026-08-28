@@ -81,7 +81,7 @@ public:
 #else
         sbcIn_ = xStreamBufferCreate(kSbcInBytes, 1);
         if (!sbcIn_) { Serial.println("[AUDIO] ERREUR: stream buffer SBC"); return false; }
-        dataTxSb_ = xStreamBufferCreate(4096, 1);   // ~64 ms de PCM du modulateur AFSK
+        dataTxSb_ = xStreamBufferCreate(3072, 1);   // ~48 ms de PCM du modulateur AFSK
         if (!dataTxSb_) { Serial.println("[AUDIO] ERREUR: stream buffer TNC"); return false; }
 
         if (!decoder_.begin()) { Serial.println("[AUDIO] ERREUR: init decodeur SBC"); return false; }
@@ -94,14 +94,21 @@ public:
             size_t pr = (size_t)AUDIO_RX_PREROLL_MS * AUDIO_SAMPLE_RATE_HZ / 1000;
             preroll_.cap = pr < kPreroll ? pr : kPreroll - 1;
         }
+        // L'AGC tourne par échantillon ADC -> au débit I2S réel.
+        agcAtk_ = 1.0f - expf(-1.0f / (AUDIO_AGC_ATTACK_MS  * 1e-3f * AUDIO_I2S_RATE));
+        agcRel_ = 1.0f - expf(-1.0f / (AUDIO_AGC_RELEASE_MS * 1e-3f * AUDIO_I2S_RATE));
+#if AUDIO_I2S_RATE != AUDIO_SAMPLE_RATE_HZ
+        rsDown_.init((float)AUDIO_I2S_RATE, (float)AUDIO_SAMPLE_RATE_HZ);   // ADC -> SBC
+        rsUp_.init((float)AUDIO_SAMPLE_RATE_HZ, (float)AUDIO_I2S_RATE);     // SBC -> DAC
+#endif
         // NB : l'I2S est installe DEPUIS la tache pumpLoop, pas ici. Le pilote
         // ADC interne prend un mutex RECURSIF (adc1_i2s_lock) qui doit etre
         // pris ET rendu par la MEME tache -> sinon assert au 1er passage TX.
 
-        xTaskCreatePinnedToCore(&AudioBridge::pumpTrampoline, "audio_pump", 4096, this, 6, &pumpTask_, 1);
-        xTaskCreatePinnedToCore(&AudioBridge::rxTrampoline,   "audio_rx",   4096, this, 5, &rxTask_,   1);
-        xTaskCreatePinnedToCore(&AudioBridge::txTrampoline,   "audio_tx",   4096, this, 5, &txTask_,   1);
-        xTaskCreatePinnedToCore(&AudioBridge::ctlTrampoline,  "audio_ctl",  3072, this, 4, &ctlTask_,  1);
+        xTaskCreatePinnedToCore(&AudioBridge::pumpTrampoline, "audio_pump", 4352, this, 6, &pumpTask_, 1);
+        xTaskCreatePinnedToCore(&AudioBridge::rxTrampoline,   "audio_rx",   3584, this, 5, &rxTask_,   1);
+        xTaskCreatePinnedToCore(&AudioBridge::txTrampoline,   "audio_tx",   3072, this, 5, &txTask_,   1);
+        xTaskCreatePinnedToCore(&AudioBridge::ctlTrampoline,  "audio_ctl",  2560, this, 4, &ctlTask_,  1);
         Serial.println("[AUDIO] Pont audio demarre");
         return true;
 #endif
@@ -131,8 +138,33 @@ public:
     bool rxFromRadio() const   { return micGateOpen_.load(); }
     bool squelchRaw() const    { return sqDbg_.load(); }
     uint32_t adcLevel() const  { return adcLevel_.load(); }
+    float    agcGain() const    { return agcGain_; }
 
 private:
+    // ---------------- Ré-échantillonneur linéaire (streaming) --------------
+    // Interpolation linéaire ; suffisant pour de la voix + du SBC, et le démod
+    // AFSK tourne au débit natif (pas ré-échantillonné). ratio = fIn / fOut.
+    struct Resampler {
+        float   ratio = 1.5f, frac = 0.0f;
+        int16_t s0 = 0, s1 = 0;
+        void init(float fin, float fout) { ratio = fin / fout; frac = 0; s0 = s1 = 0; }
+        // consomme `n` échantillons d'entrée, écrit la sortie (cap), renvoie le
+        // nombre d'échantillons produits.
+        size_t process(const int16_t* in, size_t n, int16_t* out, size_t cap) {
+            size_t o = 0;
+            for (size_t i = 0; i < n; i++) {
+                s0 = s1; s1 = in[i];
+                while (frac < 1.0f) {
+                    if (o >= cap) return o;
+                    out[o++] = (int16_t)(s0 + (s1 - s0) * frac);
+                    frac += ratio;
+                }
+                frac -= 1.0f;
+            }
+            return o;
+        }
+    };
+
     // ---------------- File PCM (SPSC lock-free, capacité = puissance de 2) --
     template <size_t N>
     struct PcmRing {
@@ -185,10 +217,10 @@ private:
     };
 
     static constexpr size_t kFrame      = sbc::kSamplesPerFrame;   // 128
-    static constexpr size_t kSbcInBytes = 4096;
-    static constexpr size_t kPlayRing   = 8192;   // ~256 ms @ 32 kHz
-    static constexpr size_t kMicRing    = 8192;   // ~256 ms : pre-roll + audio vif
-    static constexpr size_t kPreroll    = 8192;   // <= 256 ms @ 32 kHz (puissance de 2)
+    static constexpr size_t kSbcInBytes = 2048;
+    static constexpr size_t kPlayRing   = 4096;   // ~128 ms @ 32 kHz (puissance de 2)
+    static constexpr size_t kMicRing    = 8192;   // pre-roll + audio vif (puissance de 2)
+    static constexpr size_t kPreroll    = 4096;   // ~128 ms @ 32 kHz (puissance de 2)
 
     // ---------------- GPIO (PTT / SQ / bouton / LED) ---------------------
     void setupGpio() {
@@ -255,7 +287,7 @@ private:
         // audio de kv4p-ht : mono RX = ONLY_LEFT, communication_format = 0.
         i2s_config_t cfg = {};
         cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN);
-        cfg.sample_rate          = AUDIO_SAMPLE_RATE_HZ;
+        cfg.sample_rate          = AUDIO_I2S_RATE;
         cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
         cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
         cfg.communication_format = (i2s_comm_format_t)0;
@@ -278,7 +310,7 @@ private:
 #endif
         i2s_config_t cfg = {};
         cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
-        cfg.sample_rate          = AUDIO_SAMPLE_RATE_HZ;
+        cfg.sample_rate          = AUDIO_I2S_RATE;
         cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
         cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
         cfg.communication_format = (i2s_comm_format_t)0;
@@ -293,7 +325,7 @@ private:
         // GPIO25 seul : sur la carte kv4p-ht, GPIO26 fait partie du reseau de
         // polarisation ADC -> ne pas y sortir d'audio pendant l'emission.
         i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);       // GPIO25 = AUDIO_OUT
-        i2s_set_sample_rates(I2S_NUM_0, AUDIO_SAMPLE_RATE_HZ);
+        i2s_set_sample_rates(I2S_NUM_0, AUDIO_I2S_RATE);
         i2s_zero_dma_buffer(I2S_NUM_0);
         return true;
     }
@@ -320,9 +352,13 @@ private:
     static void pumpTrampoline(void* self) { static_cast<AudioBridge*>(self)->pumpLoop(); }
     void pumpLoop() {
         uint16_t adc[kFrame];
-        int16_t  mic[kFrame];
-        int16_t  play[kFrame];
-        uint16_t dac[kFrame * 2];
+        int16_t  mic[kFrame];        // ADC (après gain/AGC), au débit I2S
+        int16_t  pcmOut[kFrame * 2]; // PCM à envoyer au DAC (débit I2S)
+        uint16_t dac[kFrame * 3];    // stéréo, marge pour un éventuel sur-échantillonnage
+#if AUDIO_I2S_RATE != AUDIO_SAMPLE_RATE_HZ
+        int16_t  micDs[kFrame];      // ADC ré-échantillonné vers le débit SBC
+        int16_t  playIn[kFrame];     // PCM décodeur SBC avant sur-échantillonnage
+#endif
         size_t   n = 0;
 
         for (;;) {
@@ -340,10 +376,24 @@ private:
 #else
                         micDc_ = 2048.0f;
 #endif
-                        // Gain TOTAL direct : 16 = "unité" (pleine échelle ADC
-                        // 12 bits -> pleine échelle int16), comme le Boost(16.0)
-                        // de kv4p-ht. > 16 = amplification (risque d'écrêtage).
-                        float s = (raw - micDc_) * (float)AUDIO_MIC_GAIN;
+                        float pre = (float)raw - micDc_;
+#if AUDIO_AGC_ENABLE
+                        float s = pre * agcGain_;
+                        float rect = s < 0 ? -s : s;
+                        // suiveur de crête : montée ~2 ms, descente ~60 ms
+                        agcEnvPk_ += (rect - agcEnvPk_) * (rect > agcEnvPk_ ? 0.03f : 0.0009f);
+                        // Gain ajusté seulement squelch OUVERT et au-dessus du bruit ;
+                        // sinon gelé (pas d'emballement entre deux trames).
+                        if (gate && agcEnvPk_ > (float)AUDIO_AGC_NOISE) {
+                            float desired = agcGain_ * (float)AUDIO_AGC_TARGET / agcEnvPk_;
+                            agcGain_ += (desired - agcGain_) *
+                                        (desired < agcGain_ ? agcAtk_ : agcRel_);
+                            if (agcGain_ < (float)AUDIO_AGC_MIN_GAIN) agcGain_ = AUDIO_AGC_MIN_GAIN;
+                            if (agcGain_ > (float)AUDIO_AGC_MAX_GAIN) agcGain_ = AUDIO_AGC_MAX_GAIN;
+                        }
+#else
+                        float s = pre * (float)AUDIO_MIC_GAIN;
+#endif
                         int16_t v;
                         if (s >= 32767.f)       { v = 32767;  micClip_.fetch_add(1); }
                         else if (s <= -32768.f) { v = -32768; micClip_.fetch_add(1); }
@@ -357,30 +407,59 @@ private:
                         adcLevel_.store((uint32_t)adcEnv_);
                         adcSamples_.fetch_add(cnt);
                     }
-                    if (dataMode_.load()) {
-                        // Canal APRS : l'ADC va au démodulateur TNC, pas au SBC.
-                        if (dataRxCb_) dataRxCb_(mic, cnt);
-                    } else {
-                        // Pre-roll : sur le front d'ouverture, on injecte d'abord
-                        // les ~AUDIO_RX_PREROLL_MS captées AVANT (le squelch du
-                        // SA818 s'ouvre après le préambule d'un paquet APRS).
+                    // --- Chaîne SBC (phonie / flux audio vers HTCommander) ---
+                    // Active sur tous les canaux ; sur le canal APRS seulement
+                    // si TNC_ALSO_STREAM_AUDIO.
+#if TNC_ALSO_STREAM_AUDIO
+                    bool doSbc = true;
+#else
+                    bool doSbc = !dataMode_.load();
+#endif
+                    if (doSbc) {
+#if AUDIO_I2S_RATE != AUDIO_SAMPLE_RATE_HZ
+                        // ADC (débit I2S) -> débit SBC avant l'encodeur.
+                        size_t dn = rsDown_.process(mic, cnt, micDs, kFrame);
+                        const int16_t* sbcSrc = micDs;
+#else
+                        // ADC déjà au débit SBC : chemin direct, latence mini.
+                        size_t dn = cnt;
+                        const int16_t* sbcSrc = mic;
+#endif
                         if (gate && !gatePrev_) preroll_.drainTo(micRing_);
-                        if (gate) micRing_.write(mic, cnt);
-                        else      preroll_.push(mic, cnt);
+                        if (gate) micRing_.write(sbcSrc, dn);
+                        else      preroll_.push(sbcSrc, dn);
                     }
+                    // --- Chaîne TNC (démodulateur AFSK), en plus, sur le canal APRS ---
+                    // Le démodulateur tourne au débit natif I2S (= AFSK_SAMPLE_RATE).
+                    if (dataMode_.load() && dataRxCb_) dataRxCb_(mic, cnt);
                     gatePrev_ = gate;
                 }
             } else if (ioMode_ == IO_TX) {
-                size_t got;
-                if (dataMode_.load()) {
-                    size_t br = xStreamBufferReceive(dataTxSb_, play,
+                size_t outN;
+                if (dataTxActive()) {
+                    // Modulateur AFSK en cours (TNC TX) : débit natif (= débit
+                    // I2S), envoyé directement au DAC.
+                    size_t br = xStreamBufferReceive(dataTxSb_, pcmOut,
                                                      kFrame * sizeof(int16_t), 0);
-                    got = br / sizeof(int16_t);
+                    size_t got = br / sizeof(int16_t);
+                    for (size_t i = got; i < kFrame; i++) pcmOut[i] = 0;
+                    outN = kFrame;
                 } else {
-                    got = playRing_.read(play, kFrame);
+#if AUDIO_I2S_RATE != AUDIO_SAMPLE_RATE_HZ
+                    // Phonie : décodeur SBC -> sur-échantillonnage vers le débit I2S.
+                    size_t inWant = (size_t)((uint32_t)kFrame * AUDIO_SAMPLE_RATE_HZ / AUDIO_I2S_RATE);
+                    size_t got = playRing_.read(playIn, inWant);
+                    for (size_t i = got; i < inWant; i++) playIn[i] = 0;
+                    outN = rsUp_.process(playIn, inWant, pcmOut, (kFrame * 3) / 2);  // <= dac[]
+#else
+                    // Phonie : décodeur SBC déjà au débit I2S -> DAC direct.
+                    size_t got = playRing_.read(pcmOut, kFrame);
+                    for (size_t i = got; i < kFrame; i++) pcmOut[i] = 0;
+                    outN = kFrame;
+#endif
                 }
-                for (size_t i = 0; i < kFrame; i++) {
-                    float in = (i < got) ? (play[i] * AUDIO_SPK_VOLUME) : 0.f;
+                for (size_t i = 0; i < outN; i++) {
+                    float in = pcmOut[i] * AUDIO_SPK_VOLUME;
 #if AUDIO_DAC_LOWPASS
                     dacLp_ += (in - dacLp_) * (float)AUDIO_DAC_LP_ALPHA;   // adoucit l'escalier 8 bits
                     in = dacLp_;
@@ -391,7 +470,7 @@ private:
                     dac[2 * i] = w;
                     dac[2 * i + 1] = w;                            // GPIO25
                 }
-                i2s_write(I2S_NUM_0, dac, sizeof(dac), &n, pdMS_TO_TICKS(50));
+                i2s_write(I2S_NUM_0, dac, outN * 2 * sizeof(uint16_t), &n, pdMS_TO_TICKS(50));
             } else {
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
@@ -595,7 +674,14 @@ private:
     float    micDc_ = 2048.0f;
     float    adcEnv_ = 0.0f;
     float    dacLp_ = 0.0f;
+    float    agcGain_ = (float)AUDIO_MIC_GAIN;
+    float    agcEnvPk_ = 0.0f;
+    float    agcAtk_ = 0.02f, agcRel_ = 0.0005f;   // coeffs calculés dans begin()
     bool     gatePrev_ = false;
+#if AUDIO_I2S_RATE != AUDIO_SAMPLE_RATE_HZ
+    Resampler rsDown_;   // ADC (débit I2S) -> SBC
+    Resampler rsUp_;     // SBC -> DAC (débit I2S)
+#endif
     Preroll<kPreroll> preroll_;
     bool     vox_ = false;
     uint32_t voxLoudMs_ = 0;

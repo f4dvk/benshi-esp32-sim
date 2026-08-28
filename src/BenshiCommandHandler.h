@@ -66,8 +66,10 @@ public:
         }
         bool ok = rf_->tune(rf.rx_mhz, rf.tx_mhz, rf.rx_ctcss_hz, rf.tx_ctcss_hz,
                             rf.wide, RF_MODULE_SQUELCH);
-        // Filtres : pre/de-emphase + passe-haut + passe-bas suivent le bit
-        // pre_de_emph_bypass du canal (bypass -> tout coupe).
+        // Filtres SA818 (pré/dé-emphase + HP + BP) : on suit STRICTEMENT le bit
+        // pre_de_emph_bypass du canal actif, y compris sur le canal données
+        // (APRS). Pour tester l'AFSK avec l'audio plat, mettre emph_bypass=true
+        // sur le canal APRS dans config.h (ou via HTCommander). Aucun forçage.
         bool filt = !rf.emph_bypass;
         rf_->setFilters(filt, filt, filt);
         // Puissance : broche H/L du module (LOW = haute puissance, kv4p-ht).
@@ -75,10 +77,10 @@ public:
         digitalWrite(RF_MODULE_HL_GPIO, rf.tx_at_max_power ? LOW : HIGH);
 #endif
         Serial.printf("[SA818] Retune canal %u : RX %.4f / TX %.4f MHz, %s, CTCSS %.1f/%.1f, "
-                      "emphase %s, puissance %s -> %s\n",
+                      "filtres %s, puissance %s -> %s\n",
                       state_.activeChannelId(), rf.rx_mhz, rf.tx_mhz,
                       rf.wide ? "25kHz" : "12.5kHz", rf.rx_ctcss_hz, rf.tx_ctcss_hz,
-                      rf.emph_bypass ? "OFF" : "ON",
+                      filt ? "ON" : "PLAT (bypass)",
                       rf.tx_at_max_power ? "HAUTE" : "basse",
                       ok ? "OK" : "ECHEC (module hors bande ? pas de reponse ?)");
     }
@@ -86,6 +88,34 @@ public:
     // Appelé périodiquement par le transport (boucle Arduino).
     void pollRf() {
         if (rfDirty_.exchange(false)) syncRf();
+        pollRssiSa818();
+    }
+
+    // MODE SA818 : interroge le RSSI réel du module ("RSSI?", 0..255) et le
+    // mappe sur 0..15 pour le S-mètre du HT_STATUS Benshi — comme kv4p-ht.
+    // En mode UV-K1 (pas de module), le RSSI reste celui dérivé du niveau
+    // audio par le pont (setAudioRx). Uniquement pendant la réception.
+    void pollRssiSa818() {
+#if (RF_MODULE_RSSI_POLL_MS > 0)
+        if (!rf_ || !rf_->present()) return;
+        // Jamais pendant l'établissement de la connexion : "RSSI?" bloque l'UART
+        // jusqu'à ~60 ms et retarderait les réponses aux commandes -> on attend
+        // que le canal audio soit ouvert (handshake HTCommander terminé).
+        if (!aocConnected_.load()) return;
+        if (inTx_.load() || !sqOpen_.load()) return;   // signal reçu seulement
+        uint32_t now = millis();
+        if (now - lastRssiPollMs_ < (uint32_t)RF_MODULE_RSSI_POLL_MS) return;
+        lastRssiPollMs_ = now;
+        int v = rf_->readRssi();                        // 0..255, -1 si indispo
+        if (v < 0) return;
+        uint8_t r = (uint8_t)((v * 15 + 127) / 255);    // 0..255 -> 0..15
+        if (r < 1) r = 1;                               // signal présent -> au moins 1
+        sa818RssiValid_.store(true);
+        if (sqOpen_.load() && r != rssi_.load()) {
+            rssi_.store(r);
+            emitHtStatusChanged();
+        }
+#endif
     }
 
     // Traite un message entrant et renvoie true si une réponse doit être
@@ -204,11 +234,17 @@ public:
     }
 
     // --- Hooks du pont audio (contexte tâche) ---------------------------------
-    // Réception depuis le poste : squelch/RX ouverts + RSSI 0..15 dérivé de l'ADC.
+    // Réception depuis le poste : squelch/RX ouverts + RSSI 0..15.
+    // En mode SA818, dès qu'une lecture "RSSI?" a réussi, c'est elle qui fait
+    // foi (pollRssiSa818) ; le niveau dérivé de l'ADC ne sert qu'en mode UV-K1
+    // ou tant que le module n'a pas répondu.
     void setAudioRx(bool active, uint8_t rssi) {
-        bool changed = (active != sqOpen_.load()) || (rssi != rssi_.load());
+        uint8_t eff = !active ? 0
+                    : (sa818RssiValid_.load() ? rssi_.load() : rssi);
+        bool changed = (active != sqOpen_.load()) || (eff != rssi_.load());
         sqOpen_.store(active);
-        rssi_.store(active ? rssi : 0);
+        rssi_.store(eff);
+        if (!active) sa818RssiValid_.store(false);   // nouvelle salve -> reprise ADC en attendant "RSSI?"
         if (changed) emitHtStatusChanged();
     }
     // Émission vers le poste (HTCommander envoie de l'audio) : is_in_tx.
@@ -248,6 +284,8 @@ private:
 
     std::atomic<bool>    sqOpen_{false};
     std::atomic<uint8_t> rssi_{0};
+    uint32_t             lastRssiPollMs_ = 0;    // MODE SA818 : dernier "RSSI?" (boucle Arduino seule)
+    std::atomic<bool>    sa818RssiValid_{false}; // une lecture module a réussi
     std::atomic<bool>    aocConnected_{false};
     std::atomic<bool>    inTx_{false};
     uint8_t              volume_ = RF_MODULE_VOLUME;

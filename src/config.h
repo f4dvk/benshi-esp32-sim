@@ -96,20 +96,23 @@ struct ChannelConfig {
     double   rx_sub_audio;
     BandwidthType bandwidth;
     bool     tx_disable;
+    bool     emph_bypass;      // true = pas de pré/dé-emphase ni filtres HP/BP
+                               // (audio "plat"). Recommandé sur un canal données
+                               // AFSK/APRS ; laisser false pour la phonie.
     const char* name;          // <= 10 caractères (80 bits / 8)
 };
 
 // Modifie librement cette table : c'est la "mémoire de canaux" figée
 // de la radio simulée.
 static const ChannelConfig CHANNELS[] = {
-    { 0, 145.500000, 145.500000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE, false, "SIMPLEX1"  },
-    { 1, 146.520000, 146.520000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE, false, "CALL"      },
-    { 2, 439.987500, 439.987500, MOD_FM, MOD_FM, 0.0,   0.0,   BW_NARROW, false, "PMR1"    },
-    { 3, 433.500000, 433.500000, MOD_FM, MOD_FM, 88.5,  88.5,  BW_NARROW, false, "ASSOC1"  },
-    { 4, 144.800000, 144.800000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE, false, "APRS"      },
-    { 5, 145.500000, 145.500000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE, true,  "RXONLY"    },
-    { 6, 146.000000, 146.000000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE, false, "CH7"       },
-    { 7, 146.100000, 146.100000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE, false, "CH8"       },
+    { 0, 145.500000, 145.500000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE,   false, false, "SIMPLEX1" },
+    { 1, 146.520000, 146.520000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE,   false, false, "CALL"     },
+    { 2, 439.987500, 439.987500, MOD_FM, MOD_FM, 0.0,   0.0,   BW_NARROW, false, false, "PMR1"     },
+    { 3, 433.500000, 433.500000, MOD_FM, MOD_FM, 88.5,  88.5,  BW_NARROW, false, false, "ASSOC1"   },
+    { 4, 144.800000, 144.800000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE,   false, false, "APRS"     },
+    { 5, 145.500000, 145.500000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE,   true,  false, "RXONLY"   },
+    { 6, 146.000000, 146.000000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE,   false, false, "CH7"      },
+    { 7, 146.100000, 146.100000, MOD_FM, MOD_FM, 0.0,   0.0,   BW_WIDE,   false, false, "CH8"      },
 };
 static const uint8_t CHANNEL_COUNT = sizeof(CHANNELS) / sizeof(CHANNELS[0]);
 
@@ -175,8 +178,19 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //   PIN_PHYS_PTT1    5    bouton PTT local (optionnel)
 //   PIN_LED          2    LED d'état (optionnel)
 //   PIN_PD          19    (kv4p : power-down du module RF interne ; inutile ici)
+// Débit "fil" imposé par le protocole (SBC vers HTCommander).
 #define AUDIO_SAMPLE_RATE_HZ   32000
 #define AUDIO_SBC_BITPOOL      40
+
+// Débit RÉEL de l'I2S (ADC + DAC).
+//   = AUDIO_SAMPLE_RATE_HZ (32 kHz) : ADC/DAC au débit du codec SBC, AUCUN
+//     ré-échantillonnage -> chemin le plus court, latence audio minimale.
+//     C'est le mode par défaut.
+//   = 48000 : échantillonne large façon kv4p-ht (filtres AFSK de la lib calés
+//     sur 48 k) puis ré-échantillonne 48<->32 aux frontières SBC. Essais montrés
+//     sans gain sur le décodage APRS + latence en plus -> désactivé.
+// IMPORTANT : garder -DAFSK_SAMPLE_RATE de platformio.ini égal à cette valeur.
+#define AUDIO_I2S_RATE         32000
 
 // Le pont audio (AudioBridge.h) n'est actif qu'avec les 2 serveurs RFCOMM.
 // Mets à false pour compiler un firmware "commandes seules" (aucun I2S/DAC/ADC).
@@ -204,13 +218,31 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //     GPIO34 = kv4p-ht PIN_AUDIO_IN = ADC1_CHANNEL_6.
 #define AUDIO_ADC_ENABLE       true
 #define AUDIO_ADC_CHANNEL      6        // GPIO34 (ADC1_CH6) — comme kv4p-ht
-// Gain numérique TOTAL sur le PCM capté (multiplicateur direct de l'écart à
-// la ligne de base ADC). Repère : 16 = "unité" (pleine échelle ADC 12 bits ->
-// pleine échelle int16), c'est le Boost(16.0) de kv4p-ht avec un SA818 à
-// volume 8. Trop haut -> écrêtage (voir clip= dans la trace [DBG]) : la voix
-// pardonne, mais l'AFSK/APRS écrêté ne se décode plus. Viser clip=0 sur un
-// signal fort ; monter un peu si l'audio est trop faible en phonie.
+// Gain numérique sur le PCM capté (multiplicateur direct de l'écart à la ligne
+// de base ADC). Repère : 16 = "unité" (pleine échelle ADC 12 bits -> pleine
+// échelle int16). Utilisé tel quel si AUDIO_AGC_ENABLE = false, sinon c'est
+// juste le gain de départ de l'AGC.
 #define AUDIO_MIC_GAIN         16.0f
+
+// --- Contrôle automatique de gain (AGC) sur l'entrée ADC -----------------
+// Ajuste le gain en continu pour viser AUDIO_AGC_TARGET (crête int16) quel que
+// soit le niveau du signal reçu -> plus besoin de régler RF_MODULE_VOLUME /
+// AUDIO_MIC_GAIN à la main, et pas d'écrêtage sur signal fort.
+// Attaque rapide (baisse le gain vite si ça sature), retour lent (remonte
+// doucement) ; le gain est gelé tant que le signal est sous AUDIO_AGC_NOISE
+// (pas d'emballement sur le bruit de fond). Le démodulateur AFSK est
+// insensible à l'amplitude (démod par différence de phase) -> l'AGC ne gêne
+// pas l'APRS.
+#define AUDIO_AGC_ENABLE       true
+#define AUDIO_AGC_TARGET       8000.0f    // crête int16 visée (~25 % pleine échelle)
+#define AUDIO_AGC_MIN_GAIN     1.0f
+#define AUDIO_AGC_MAX_GAIN     24.0f
+#define AUDIO_AGC_NOISE        400.0f     // sous ce niveau (crête, après gain) le gain est gelé
+#define AUDIO_AGC_ATTACK_MS    20.0f      // baisse du gain : assez vite pour éviter l'écrêtage
+#define AUDIO_AGC_RELEASE_MS   3000.0f    // remontée : très lente -> pas de pompage dans une trame
+// Le gain n'est ajusté que quand le squelch est OUVERT (signal présent) ;
+// fermé, il est GELÉ à sa dernière valeur -> pas d'emballement sur le bruit
+// entre deux trames.
 #define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais)
 // Polarisation de l'entrée ADC : l'ESP injecte VDD/2 sur GPIO26 (DAC2) pour
 // centrer le signal audio de la cible (couplé en alternatif via un condo),
@@ -223,10 +255,15 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // entre "entrée ADC" (réception) et "sortie DAC" (émission) à chaque
 // changement de PTT — comme kv4p-ht. Half-duplex, comme une vraie radio.
 //
-// Horloge I2S : APLL = clock plus précise. kv4p-ht l'active ; certains
-// rapportent que l'APLL ne marche pas avec le DAC intégré -> false par défaut,
-// à essayer à true si le son est déformé / faux en fréquence.
-#define AUDIO_I2S_APLL         false
+// Horloge I2S : APLL = clock beaucoup plus précise. kv4p-ht l'active pour
+// l'ADC ET le DAC intégrés (config.use_apll = true dans rxAudio.h / txAudio.h),
+// donc l'APLL fonctionne bien avec l'ADC/DAC interne sur ESP32.
+// IMPORTANT pour le TNC : sans APLL, l'I2S se cale sur ~47744 Hz (-0,53 %)
+// au lieu de 48000. Or la PLL du slicer AFSK (esp32-afsk) n'a qu'une plage
+// de poursuite de ±0,51 % (ppm = 5100e-6) : une horloge à -0,53 % sort de
+// cette fenêtre et empêche l'accrochage -> aucune trame décodée.
+// -> true par défaut. Repasser à false uniquement si le son DAC est déformé.
+#define AUDIO_I2S_APLL         true
 
 // --- PTT : SORTIE qui keye l'émission du poste quand HTCommander émet
 //     (dès que des trames AudioData arrivent ; relâché après AUDIO_PTT_TAIL_MS
@@ -308,6 +345,13 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // Défaut 1 (phonie). Mettre 0 pour l'APRS / les données.
 #define RF_MODULE_SQUELCH     1
 #define RF_MODULE_WIDE        true      // true = 25 kHz, false = 12,5 kHz (si le canal ne le fixe pas)
+// En MODE SA818 : période d'interrogation du RSSI réel du module (commande
+// "RSSI?", comme kv4p-ht qui le fait toutes les 100 ms). La valeur 0..255 du
+// module est mise à l'échelle 0..15 pour le S-mètre du HT_STATUS Benshi.
+// Chaque lecture bloque l'UART jusqu'à ~60 ms -> ne pas descendre trop bas.
+// N'est interrogé que pendant la réception (pin SQ ouvert), jamais en émission.
+// 0 = désactive l'interrogation module -> RSSI dérivé du niveau audio (mode UV-K1).
+#define RF_MODULE_RSSI_POLL_MS 250
 // Broche H/L de puissance du module (kv4p-ht PIN_HL : v2.0c = 23, sinon -1).
 // LOW = puissance haute, HIGH = puissance basse. Pilotée par le bit
 // tx_at_max_power du canal.
@@ -334,6 +378,19 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // Dépend de dkaukov/esp32-afsk (GPL-3). false = pas de TNC, pas de dépendance.
 #define TNC_ENABLE            true
 #define TNC_CHANNEL_NAME      "APRS"
+// true (défaut) : sur le canal APRS, l'audio est TOUJOURS encodé en SBC et
+// streamé vers HTCommander, en plus du décodage TNC matériel -> son modem
+// logiciel peut décoder en parallèle (FEC FX.25) et tu vois/écoutes la forme
+// d'onde. Le premier des deux qui accroche gagne (HTCommander dédoublonne).
+// false : sur le canal APRS, pas de flux audio (TNC matériel seul, ~23 ko/s
+// de Bluetooth économisés).
+#define TNC_ALSO_STREAM_AUDIO true
+
+// Délai (ms) entre "HTCommander pleinement connecté" (canaux COMMANDE **et**
+// AUDIO mappés) et le démarrage du modem AFSK. Le TNC consomme ~15 ko de heap
+// d'un coup ; le faire pendant l'établissement de la 2e liaison RFCOMM affame
+// L2CAP -> HTCommander décroche. On attend donc que la connexion soit stable.
+#define TNC_START_DELAY_MS    3000
 
 // ----------------------------------------------------------------------
 // 7) Traces de mise au point
