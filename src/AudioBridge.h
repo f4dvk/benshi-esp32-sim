@@ -52,6 +52,7 @@ public:
     void onTxEnd(TxEndFn fn)     { txEndCb_   = std::move(fn); }
     void onRxLevel(RxLevelFn fn) { rxLevelCb_ = std::move(fn); }
     void onTxState(TxStateFn fn) { txStateCb_ = std::move(fn); }
+    void setChannelUp(bool up)   { channelUp_.store(up); }   // canal RFCOMM audio connecté ?
 
     bool begin() {
 #if !AUDIO_BRIDGE_ENABLE
@@ -67,6 +68,10 @@ public:
                       encoder_.frameLen(), (unsigned)sbc::kSamplesPerFrame);
 
         setupGpio();
+        {
+            size_t pr = (size_t)AUDIO_RX_PREROLL_MS * AUDIO_SAMPLE_RATE_HZ / 1000;
+            preroll_.cap = pr < kPreroll ? pr : kPreroll - 1;
+        }
         // NB : l'I2S est installe DEPUIS la tache pumpLoop, pas ici. Le pilote
         // ADC interne prend un mutex RECURSIF (adc1_i2s_lock) qui doit etre
         // pris ET rendu par la MEME tache -> sinon assert au 1er passage TX.
@@ -136,10 +141,32 @@ private:
         }
     };
 
+    // Fenetre glissante des N derniers echantillons (pre-roll RX).
+    template <size_t N>
+    struct Preroll {
+        int16_t buf[N];
+        size_t  wr = 0, fill = 0;
+        size_t  cap = N;              // nb d'echantillons conserves (<= N)
+        void push(const int16_t* s, size_t n) {
+            for (size_t i = 0; i < n; i++) { buf[wr] = s[i]; wr = (wr + 1) & (N - 1); }
+            fill = (fill + n < cap) ? fill + n : cap;
+        }
+        template <class Ring> void drainTo(Ring& r) {
+            size_t start = (wr - fill) & (N - 1);
+            for (size_t i = 0; i < fill; i++) {
+                int16_t s = buf[(start + i) & (N - 1)];
+                r.write(&s, 1);
+            }
+            fill = 0; wr = 0;
+        }
+        void clear() { fill = 0; wr = 0; }
+    };
+
     static constexpr size_t kFrame      = sbc::kSamplesPerFrame;   // 128
     static constexpr size_t kSbcInBytes = 4096;
     static constexpr size_t kPlayRing   = 8192;   // ~256 ms @ 32 kHz
-    static constexpr size_t kMicRing    = 4096;
+    static constexpr size_t kMicRing    = 8192;   // ~256 ms : pre-roll + audio vif
+    static constexpr size_t kPreroll    = 8192;   // <= 256 ms @ 32 kHz (puissance de 2)
 
     // ---------------- GPIO (PTT / SQ / bouton / LED) ---------------------
     void setupGpio() {
@@ -291,8 +318,14 @@ private:
 #else
                         micDc_ = 2048.0f;
 #endif
-                        float s = (raw - micDc_) * (AUDIO_MIC_GAIN * 16.0f);
-                        int16_t v = s > 32767.f ? 32767 : (s < -32768.f ? -32768 : (int16_t)s);
+                        // Gain TOTAL direct : 16 = "unité" (pleine échelle ADC
+                        // 12 bits -> pleine échelle int16), comme le Boost(16.0)
+                        // de kv4p-ht. > 16 = amplification (risque d'écrêtage).
+                        float s = (raw - micDc_) * (float)AUDIO_MIC_GAIN;
+                        int16_t v;
+                        if (s >= 32767.f)       { v = 32767;  micClip_.fetch_add(1); }
+                        else if (s <= -32768.f) { v = -32768; micClip_.fetch_add(1); }
+                        else                      v = (int16_t)s;
                         mic[i] = v;
                         absSum += (uint32_t)(v < 0 ? -v : v);
                     }
@@ -302,7 +335,13 @@ private:
                         adcLevel_.store((uint32_t)adcEnv_);
                         adcSamples_.fetch_add(cnt);
                     }
+                    // Pre-roll : sur le front d'ouverture, on injecte d'abord
+                    // les ~AUDIO_RX_PREROLL_MS captees AVANT (le squelch du
+                    // SA818 s'ouvre apres le preambule d'un paquet APRS).
+                    if (gate && !gatePrev_) preroll_.drainTo(micRing_);
+                    gatePrev_ = gate;
                     if (gate) micRing_.write(mic, cnt);
+                    else      preroll_.push(mic, cnt);
                 }
             } else if (ioMode_ == IO_TX) {
                 size_t got = playRing_.read(play, kFrame);
@@ -378,17 +417,21 @@ private:
 public:
     uint32_t encFramesTake() { return encFrames_.exchange(0); }  // trace : trames SBC produites
     uint32_t adcSamplesTake() { return adcSamples_.exchange(0); } // trace : ech. ADC lus (=> Hz reel)
+    uint32_t micClipTake()   { return micClip_.exchange(0); }     // trace : ech. ADC ecretes
 private:
 
     // ---------------- Tâche de contrôle : PTT, squelch, statut ----------
     static void ctlTrampoline(void* self) { static_cast<AudioBridge*>(self)->ctlLoop(); }
     void ctlLoop() {
-        uint32_t sqSinceMs  = 0;     // anti-rebond squelch
-        bool     sqStable   = false;
-        bool     txPrev     = false;
-        bool     rxGatePrev = false;
-        uint32_t lastRssiMs = 0;
-        uint8_t  rssiPrev   = 0;
+        bool     sqStable      = false;
+        bool     sqRawPrev     = false;
+        uint32_t sqRawRoseMs   = 0;   // date de la derniere montee de sqRaw
+        uint32_t sqRawOpenMs   = 0;   // derniere fois que sqRaw etait vrai
+        bool     txPrev        = false;
+        bool     rxGatePrev    = false;
+        bool     sigPrev       = false;
+        uint32_t lastRssiMs    = 0;
+        uint8_t  rssiPrev      = 0;
 
         for (;;) {
             uint32_t now = millis();
@@ -417,46 +460,64 @@ private:
             if (!vox_ && lvl > (uint32_t)AUDIO_SQ_VOX_THRESH) vox_ = true;
             else if (vox_ && now - voxLoudMs_ > 400)          vox_ = false;
 #endif
-            // --- Squelch débruité (25 ms) ---
+            // --- Squelch : attaque rapide, RELACHEMENT retardé (traîne) ---
+            // Le pin SQ du SA818 clignote pendant une réception AFSK/APRS :
+            // sans traîne on hache l'audio en dizaines de fragments.
             bool sqRaw = squelchHwOpen() || physPttPressed();
             sqDbg_.store(sqRaw);
-            if (sqRaw != sqStable) {
-                if (sqSinceMs == 0) sqSinceMs = now;
-                else if (now - sqSinceMs > 25) { sqStable = sqRaw; sqSinceMs = 0; }
-            } else {
-                sqSinceMs = 0;
-            }
+            if (sqRaw && !sqRawPrev) sqRawRoseMs = now;
+            if (sqRaw) sqRawOpenMs = now;
+            sqRawPrev = sqRaw;
+
+            if (!sqStable && sqRaw && (now - sqRawRoseMs) >= (uint32_t)AUDIO_SQ_ATTACK_MS)
+                sqStable = true;
+            else if (sqStable && !sqRaw && (now - sqRawOpenMs) >= (uint32_t)AUDIO_SQ_HANG_MS)
+                sqStable = false;
 
             // --- Capture ADC -> HTCommander (jamais pendant l'émission) ---
+            // Squelch "ouvert en permanence" : soit AUDIO_RX_ALWAYS, soit le
+            // squelch du module réglé à 0 (RF_MODULE_SQUELCH). Comme kv4p-ht :
+            // le pilote pousse TOUJOURS l'audio à l'appli, qui décide. Le pin SQ
+            // matériel n'est alors qu'une indication (RSSI / statut).
+#if AUDIO_RX_ALWAYS || (RF_MODULE_SQUELCH == 0)
+            bool rxGate = channelUp_.load() && !tx;   // capture audio en continu
+#else
             bool rxGate = sqStable && !tx;
-            bool rxOpened  = rxGate && !rxGatePrev;
-            bool rxClosed  = !rxGate && rxGatePrev;
+#endif
+            bool rxOpened = rxGate && !rxGatePrev;
+            bool rxClosed = !rxGate && rxGatePrev;
             rxGatePrev = rxGate;
             if (rxOpened || rxClosed) micGateOpen_.store(rxGate);
             if (rxClosed && txEndCb_) txEndCb_();               // AudioEnd -> HTCommander
 #if AUDIO_DEBUG
-            if (rxOpened) Serial.printf("[AUDIO] RX poste : squelch OUVERT -> capture ADC (niveau %lu)\n",
+            if (rxOpened) Serial.printf("[AUDIO] RX : capture ADC ouverte (niveau %lu)\n",
                                         (unsigned long)adcLevel_.load());
-            if (rxClosed) Serial.println("[AUDIO] RX poste : squelch fermé -> AudioEnd");
+            if (rxClosed) Serial.println("[AUDIO] RX : capture ADC fermée -> AudioEnd");
 #endif
 
-            // --- RSSI 0..15 dérivé du niveau ADC ---
-            if (rxGate) {
+            // --- Signal présent (pour is_sq / is_in_rx / RSSI) : suit TOUJOURS
+            //     le pin SQ débruité, même en capture continue -> l'indicateur
+            //     RX et le S-mètre de HTCommander restent corrects.
+            bool sig = sqStable && !tx;
+            bool sigOn  = sig && !sigPrev;
+            bool sigOff = !sig && sigPrev;
+            sigPrev = sig;
+            if (sig) {
                 float l = log2f((float)adcLevel_.load() + 1.0f);
                 uint8_t rssi = l >= 15.f ? 15 : (uint8_t)(l + 0.5f);
                 if (rssi < 1) rssi = 1;
-                if (rxOpened || (rssi != rssiPrev && now - lastRssiMs > 150)) {
+                if (sigOn || (rssi != rssiPrev && now - lastRssiMs > 150)) {
                     rssiPrev = rssi; lastRssiMs = now;
                     if (rxLevelCb_) rxLevelCb_(true, rssi);
                 }
-            } else if (rxClosed) {
+            } else if (sigOff) {
                 rssiPrev = 0;
                 if (rxLevelCb_) rxLevelCb_(false, 0);
             }
 
-            // --- LED d'état : fixe en émission, clignote en réception ---
+            // --- LED d'état : fixe en émission, clignote sur signal reçu ---
 #if (AUDIO_STATUS_LED_GPIO >= 0)
-            bool led = tx || (rxGate && ((now / 120) & 1));
+            bool led = tx || (sig && ((now / 120) & 1));
             digitalWrite(AUDIO_STATUS_LED_GPIO, led ? HIGH : LOW);
 #endif
             vTaskDelay(pdMS_TO_TICKS(10));
@@ -483,14 +544,18 @@ private:
     std::atomic<bool>     hcTxActive_{false};   // émission vers le poste en cours
     std::atomic<bool>     micGateOpen_{false};  // capture ADC -> HTCommander ouverte
     std::atomic<bool>     sqDbg_{false};        // état brut du squelch (trace)
+    std::atomic<bool>     channelUp_{false};    // canal RFCOMM audio connecté
     std::atomic<uint32_t> encFrames_{0};        // trames SBC produites par txLoop
     std::atomic<uint32_t> adcSamples_{0};       // echantillons ADC lus (=> Hz reel)
+    std::atomic<uint32_t> micClip_{0};          // echantillons ADC ecretes
     std::atomic<bool>     wantTx_{false};       // sens I2S0 demandé (pumpLoop applique)
     IoMode                ioMode_ = IO_NONE;    // sens I2S0 courant (pumpLoop uniquement)
 
     float    micDc_ = 2048.0f;
     float    adcEnv_ = 0.0f;
     float    dacLp_ = 0.0f;
+    bool     gatePrev_ = false;
+    Preroll<kPreroll> preroll_;
     bool     vox_ = false;
     uint32_t voxLoudMs_ = 0;
 };

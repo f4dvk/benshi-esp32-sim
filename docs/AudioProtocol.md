@@ -137,6 +137,12 @@ pendant que la tâche Bluetooth peut l'écrire (`WRITE_*`). Lecture potentiellem
   RFCOMM sature (`ESP_SPP_CONG_EVT`).
 - Bascule ADC↔DAC : le mutex récursif `adc1_i2s_lock` doit être pris **et**
   rendu par la même tâche → tout l'I2S est géré depuis `audio_pump`.
+- **Voix** : OK. **APRS / données** : le pin SQ du SA818 s'ouvre *après* le
+  préambule AX.25 et clignote → sans traitement, HTCommander perd la synchro.
+  Atténuations : `AUDIO_RX_PREROLL_MS` (on pousse l'audio capté *avant*
+  l'ouverture du squelch), `AUDIO_SQ_HANG_MS` (traîne), `AUDIO_RX_ALWAYS`
+  (ignore le pin SQ, stream continu). Le paramètre squelch de `AT+DMOSETGROUP`
+  n'agit **pas** sur le pin SQ (qui suit la détection de porteuse).
 
 ### Pistes d'amélioration
 
@@ -144,3 +150,5 @@ pendant que la tâche Bluetooth peut l'écrire (`WRITE_*`). Lecture potentiellem
   logiciel 1 pôle) ou sortie PDM + filtre RC (comme kv4p-ht) pour faire mieux.
 - Le type de trame audio *venant* de la radio est `0x00` (confirmé : HTCommander
   décode `0x00` et `0x03` de la même façon).
+- **APRS fiable** = canal données Benshi (`HT_SEND_DATA` / `RX_DATA`, cmd 31/57,
+  trames AX.25 hors audio/SBC) — non implémenté.

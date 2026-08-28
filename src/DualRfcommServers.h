@@ -203,20 +203,22 @@ public:
             dbgLastMs_ = now;
             uint32_t enc = audio_.encFramesTake();
             uint32_t sps = audio_.adcSamplesTake();
+            uint32_t clip = audio_.micClipTake();
             Serial.printf(
-                "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz | "
+                "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz clip=%lu | "
                 "RX<-HTC: cmd=%u audioData=%uf/%uo types=0x%03X | "
                 "mic: enc=%u SBC/s -> spp chunks sent=%u drop~=%u qlen=%u | "
                 "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu\n",
                 (unsigned long)cmdHandle_, (unsigned long)audioHandle_,
                 (unsigned long)pendingConn_, (int)audioCong_,
-                audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps,
+                audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps, (unsigned long)clip,
                 dbgCmdFrames_, dbgAudioFrames_, dbgAudioBytes_, dbgAudioTypes_,
                 enc, dbgAudioSent_, dbgAudioDrop_, (unsigned)audioTxQ_.size(),
                 (int)audio_.txToRadio(), (int)audio_.squelchRaw(),
                 (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel());
             dbgCmdFrames_ = dbgAudioFrames_ = dbgAudioBytes_ = 0;
             dbgAudioSent_ = dbgAudioDrop_ = 0;
+            dbgAudioTypes_ = 0;
         }
 #endif
     }
@@ -458,7 +460,7 @@ private:
                     audioWriteInFlight_ = false;
                     audioCong_ = false;
                     unlockAudio();
-                    handler_.setAudioConnected(false);
+                    handler_.setAudioConnected(false); audio_.setChannelUp(false);
                     handler_.setAudioRx(false, 0);
                     handler_.setAudioTx(false);
                 }
@@ -544,7 +546,7 @@ private:
             audioWriteInFlight_ = false;
             audioCong_ = false;
             unlockAudio();
-            handler_.setAudioConnected(true);
+            handler_.setAudioConnected(true); audio_.setChannelUp(true);
             Serial.printf("[SPP-DUAL] -> canal AUDIO (handle=%lu, scn cmd=%u audio=%u)\n",
                           (unsigned long)handle, cmdScn_, audioScn_);
         } else {

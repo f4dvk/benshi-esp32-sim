@@ -204,7 +204,13 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //     GPIO34 = kv4p-ht PIN_AUDIO_IN = ADC1_CHANNEL_6.
 #define AUDIO_ADC_ENABLE       true
 #define AUDIO_ADC_CHANNEL      6        // GPIO34 (ADC1_CH6) — comme kv4p-ht
-#define AUDIO_MIC_GAIN         8.0f     // gain numérique appliqué au PCM capté
+// Gain numérique TOTAL sur le PCM capté (multiplicateur direct de l'écart à
+// la ligne de base ADC). Repère : 16 = "unité" (pleine échelle ADC 12 bits ->
+// pleine échelle int16), c'est le Boost(16.0) de kv4p-ht avec un SA818 à
+// volume 8. Trop haut -> écrêtage (voir clip= dans la trace [DBG]) : la voix
+// pardonne, mais l'AFSK/APRS écrêté ne se décode plus. Viser clip=0 sur un
+// signal fort ; monter un peu si l'audio est trop faible en phonie.
+#define AUDIO_MIC_GAIN         16.0f
 #define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais)
 // Polarisation de l'entrée ADC : l'ESP injecte VDD/2 sur GPIO26 (DAC2) pour
 // centrer le signal audio de la cible (couplé en alternatif via un condo),
@@ -240,6 +246,24 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define AUDIO_SQ_ACTIVE_LOW    true     // LOW = squelch ouvert (signal présent)
 #define AUDIO_SQ_PULLUP        true
 #define AUDIO_SQ_VOX_THRESH    600      // |PCM| moyen déclenchant la VOX (si SQ=-1)
+// Traîne squelch : le pin SQ du SA818 clignote souvent en cours de réception
+// (surtout sur un signal AFSK/APRS). On garde la capture ouverte pendant ce
+// délai après la dernière fermeture -> un seul flux audio continu vers
+// HTCommander au lieu de fragments hachés. 250-500 ms typique.
+#define AUDIO_SQ_HANG_MS       500
+#define AUDIO_SQ_ATTACK_MS     4        // anti-rebond à l'ouverture
+// Pre-roll : nombre de ms d'audio capté AVANT l'ouverture du squelch que l'on
+// pousse quand même à HTCommander. Le pin SQ du SA818 s'ouvre APRÈS le
+// préambule d'une trame APRS -> sans pre-roll, HTCommander perd la synchro AX.25
+// et ne décode pas. 150-250 ms.
+#define AUDIO_RX_PREROLL_MS    220
+
+// APRS / données : le pin SQ du SA818 ne suit PAS le paramètre de squelch
+// (AT+DMOSETGROUP squelch=0) -> il reste piloté par la détection de porteuse.
+// Mets true pour IGNORER le pin SQ et streamer l'audio EN PERMANENCE vers
+// HTCommander (son modem logiciel décode alors n'importe quel paquet).
+// Coût : ~23 ko/s de Bluetooth en continu + souffle joué en phonie.
+#define AUDIO_RX_ALWAYS        false
 
 // --- Bouton PTT local (optionnel) : force la capture ADC -> HTCommander,
 //     comme si le squelch était ouvert. kv4p-ht : 5 ou 33.
@@ -274,8 +298,15 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define RF_MODULE_UART_TX     17        // ESP TX  -> RX du module
 #define RF_MODULE_PD_GPIO     19        // PD : HIGH = module alimenté (-1 = non câblé)
 #define RF_MODULE_PROBES      3         // nb de handshakes AT+DMOCONNECT avant abandon
-#define RF_MODULE_VOLUME      6         // volume HP du module, 1..8
-#define RF_MODULE_SQUELCH     1         // squelch matériel du module, 0..8 (0 = ouvert)
+#define RF_MODULE_VOLUME      8         // volume HP du module, 1..8 (kv4p-ht : 8)
+// Squelch du module SA818, 0..8. Valeur envoyée dans AT+DMOSETGROUP.
+//   0 = squelch OUVERT : le module passe l'audio en permanence ET le firmware
+//       ignore alors le pin SQ pour la capture (comme kv4p-ht) -> HTCommander
+//       reçoit un flux continu, son modem logiciel décode l'APRS de lui-même.
+//       Le pin SQ reste utilisé pour l'indicateur RX / le S-mètre.
+//   1..8 = squelch fermé au repos, capture déclenchée par le pin SQ (phonie).
+// Défaut 1 (phonie). Mettre 0 pour l'APRS / les données.
+#define RF_MODULE_SQUELCH     1
 #define RF_MODULE_WIDE        true      // true = 25 kHz, false = 12,5 kHz (si le canal ne le fixe pas)
 // Broche H/L de puissance du module (kv4p-ht PIN_HL : v2.0c = 23, sinon -1).
 // LOW = puissance haute, HIGH = puissance basse. Pilotée par le bit
