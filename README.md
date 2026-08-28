@@ -7,13 +7,13 @@
 > des canaux mémoire avec persistance en mémoire flash (NVS), sélection du
 > VFO / canal actif, région.
 >
-> Audio : **implémenté mais non validé sur matériel.** Le codec SBC 32 kHz
-> (encodeur + décodeur de `libbt.a`), le framing du canal audio, le pont vers
-> le **DAC et l'ADC internes** de l'ESP32 et les notifications de statut
-> (`HT_STATUS_CHANGED` : squelch / S-mètre pendant la réception) sont en
-> place. Il reste à régler à l'oreille le mode ADC+DAC interne simultané et à
-> câbler l'étage analogique (voir « Audio » plus bas). Développé sans matériel
-> de test.
+> Audio : **implémenté mais non validé sur matériel.** Codec SBC 32 kHz
+> (encodeur + décodeur de `libbt.a`), framing du canal audio, pont vers le
+> **DAC / ADC internes**, **sortie PTT et entrée squelch** pour piloter un
+> poste réel (brochage aligné sur [kv4p-ht](https://github.com/VanceVagell/kv4p-ht)),
+> et notifications de statut (`HT_STATUS_CHANGED` : TX / squelch / S-mètre).
+> Il reste à régler à l'oreille le mode ADC+DAC interne simultané et à câbler
+> l'étage analogique (voir « Audio » plus bas). Développé sans matériel de test.
 >
 > Ce qui **ne fonctionne pas encore** : le mode VFO fréquence libre.
 >
@@ -84,12 +84,13 @@ plus compilé par défaut.
   type `RfCh`/`Settings`/`DevInfo`.
 - **Notifications non sollicitées** (`BenshiCommandHandler.h`) :
   `EVENT_NOTIFICATION / HT_STATUS_CHANGED` poussé sur le canal commande après
-  chaque écriture, et pendant la réception audio (`is_sq` / `is_in_rx` + RSSI
-  0-15 dérivé du niveau du PCM décodé). Byte-pour-byte identique à ce
-  qu'émet une vraie VR-N76. Respecte `REGISTER_NOTIFICATION`.
-- **Pont audio** (`AudioBridge.h` + `SbcCodec.h`) : canal RFCOMM audio ↔ DAC /
-  ADC internes de l'ESP32, codec SBC réutilisé depuis `libbt.a` (voir
-  [`docs/AudioProtocol.md`](docs/AudioProtocol.md)).
+  chaque écriture, et pendant l'audio (`is_in_tx` à l'émission, `is_sq` /
+  `is_in_rx` + RSSI en réception). Byte-pour-byte identique à ce qu'émet une
+  vraie VR-N76. Respecte `REGISTER_NOTIFICATION`.
+- **Interface poste réel** (`AudioBridge.h` + `SbcCodec.h`) : canal RFCOMM audio
+  ↔ DAC / ADC internes + **sortie PTT** et **entrée squelch** pour piloter un
+  émetteur-récepteur externe (ex. Quansheng UV-K1). Codec SBC réutilisé depuis
+  `libbt.a`. Brochage kv4p-ht. Voir [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
 
 ## Détection par HTCommander — d'après son code source
 
@@ -171,40 +172,56 @@ entre deux fenêtres de scan et il faut parfois relancer la découverte
 plusieurs fois. Pense aussi à **éteindre la vraie VR-N76** pendant les tests
 (même nom Bluetooth → confusion possible).
 
-## Audio — pont Bluetooth ↔ DAC / ADC internes
+## Audio — interface entre HTCommander et un poste réel (ex. Quansheng UV-K1)
 
-Le canal RFCOMM audio transporte du **SBC 32 kHz / 16 bits / mono** (mono,
-8 sous-bandes, 16 blocs, allocation *loudness*, bitpool 40 — paramètres
-confirmés depuis le code de HTCommander). Le firmware :
+Le firmware peut servir d'**adaptateur Bluetooth** pour un vrai émetteur-récepteur :
+HTCommander cause en Bluetooth avec le simulateur, qui relaie l'audio et le
+PTT vers un poste câblé sur quelques broches.
 
-- **décode / encode le SBC** en réutilisant l'encodeur (`SBC_Encoder`) et le
-  décodeur (`OI_CODEC_SBC_DecodeFrame`) **déjà présents dans `libbt.a`** ;
-  seuls les en-têtes sont vendorisés dans [`lib/sbc/`](lib/sbc/) — aucune
-  dépendance ajoutée (même approche que `VendorSdpRecord.h` pour le SDP) ;
-- fait transiter le PCM via le **DAC et l'ADC internes** de l'ESP32, pilotés
-  par l'unique I2S0 en mode « built-in ADC + DAC » full-duplex
-  (`AudioBridge.h`, calqué sur l'exemple ESP-IDF `i2s_adc_dac`).
+- Le canal RFCOMM audio transporte du **SBC 32 kHz / 16 bits / mono** (8
+  sous-bandes, 16 blocs, allocation *loudness*, bitpool 40 — confirmé depuis
+  le code de HTCommander).
+- **Codec SBC** : encodeur (`SBC_Encoder`) et décodeur (`OI_CODEC_SBC_DecodeFrame`)
+  **déjà présents dans `libbt.a`** ; seuls les en-têtes sont vendorisés dans
+  [`lib/sbc/`](lib/sbc/) — aucune dépendance ajoutée.
+- **Audio matériel** : DAC et ADC **internes** de l'ESP32, pilotés par l'unique
+  I2S0 en mode « built-in ADC + DAC » full-duplex (`AudioBridge.h`, calqué sur
+  l'exemple ESP-IDF `i2s_adc_dac`).
 
-### Brochage (GPIO)
+### Brochage — aligné sur [kv4p-ht](https://github.com/VanceVagell/kv4p-ht)
 
-| Fonction | GPIO | Détail |
-|---|---|---|
-| **Sortie DAC** — haut-parleur (réception) | **GPIO25** (DAC1) *et* **GPIO26** (DAC2) | Mode « built-in DAC » : l'I2S pilote les deux broches. Brancher l'ampli sur **GPIO25**. Sortie 0–3,3 V 8 bits → **ampli externe indispensable** (PAM8302 / LM386). |
-| **Entrée ADC** — micro (émission) | **GPIO34** (`ADC1_CH6`) | `AUDIO_ADC_CHANNEL` dans `config.h` (0=GPIO36 … 6=GPIO34 7=GPIO35, **ADC1 uniquement** — ADC2 entre en conflit radio). Prévoir un **micro électret + préampli polarisé vers ~1,65 V** (VDD/2). |
-| **PTT** (déclenche l'émission micro) | **désactivé** (`AUDIO_PTT_GPIO = -1`) | Mettre un numéro de GPIO pour activer : broche tirée à la masse = émission. Tant que `-1`, le micro reste muet et seule la réception est active. |
+Les broches reprennent celles du firmware kv4p-ht pour ESP32 WROOM-32
+(`kv4p_ht_esp32_wroom_32/globals.h`), pour qu'une même carte / un même
+adaptateur serve aux deux projets.
 
-Tout est configurable dans la **section 5 de [`src/config.h`](src/config.h)**
-(`AUDIO_DAC_ENABLE`, `AUDIO_ADC_ENABLE`, `AUDIO_ADC_CHANNEL`, `AUDIO_PTT_GPIO`,
-`AUDIO_SPK_VOLUME`, `AUDIO_MIC_GAIN`, `AUDIO_SBC_BITPOOL`…). Poser
-`AUDIO_BRIDGE_ENABLE` à `false` compile un firmware « commandes seules » sans
-aucun accès I2S / DAC / ADC.
+| Fonction | GPIO | kv4p-ht | Détail |
+|---|---|---|---|
+| **Audio → poste** (DAC) | **25** (+26) | `PIN_AUDIO_OUT` | Sortie du DAC interne vers l'**entrée micro** du poste. 0–3,3 V / 8 bits → prévoir un **atténuateur** vers le niveau micro. L'I2S pilote GPIO25 *et* GPIO26 ; utiliser GPIO25. |
+| **Audio ← poste** (ADC) | **34** (`ADC1_CH6`) | `PIN_AUDIO_IN` | Entrée ADC1 depuis la **sortie HP** du poste. `AUDIO_ADC_CHANNEL` dans `config.h` (ADC1 uniquement — ADC2 en conflit radio). |
+| **PTT → poste** (sortie) | **18** | `PIN_PTT` | Keye l'émission du poste dès que HTCommander envoie de l'audio ; relâché après `AUDIO_PTT_TAIL_MS`. **Actif à l'état bas** (comme kv4p-ht). |
+| **Squelch ← poste** (entrée) | **32** | `PIN_SQ` | Signale que le poste reçoit → démarre la capture ADC vers HTCommander et renseigne `is_sq` / `is_in_rx` / RSSI. `-1` ⇒ détection **VOX** sur le signal ADC. Actif à l'état bas par défaut. |
+| PTT local (option) | `-1` | `PIN_PHYS_PTT1/2` (5 / 33) | Force la capture ADC → HTCommander comme si le squelch était ouvert. |
+| LED d'état (option) | `-1` | `PIN_LED` (2) | Fixe en émission, clignote en réception. |
+
+Tout se règle dans la **section 5 de [`src/config.h`](src/config.h)**
+(`AUDIO_PTT_GPIO`, `AUDIO_PTT_ACTIVE_LOW`, `AUDIO_PTT_TAIL_MS`, `AUDIO_SQ_GPIO`,
+`AUDIO_SQ_ACTIVE_LOW`, `AUDIO_SQ_VOX_THRESH`, `AUDIO_ADC_CHANNEL`,
+`AUDIO_SPK_VOLUME`, `AUDIO_MIC_GAIN`, `AUDIO_SBC_BITPOOL`…). `AUDIO_BRIDGE_ENABLE`
+à `false` compile un firmware « commandes seules » (aucun accès I2S / DAC / ADC /
+GPIO audio).
+
+> `PIN_PD` (GPIO19) et l'UART RF (16/17) de kv4p-ht pilotent son module radio
+> **interne** (SA818) : sans objet ici puisque le poste est externe. Ces broches
+> restent libres.
 
 ### À valider sur matériel
 
 Le mode ADC + DAC internes **simultané** de l'ESP32 (un seul I2S0) est
-notoirement bruyant et sensible au format d'échantillon. La chaîne
-SBC + framing + files d'attente est en revanche indépendante du matériel.
-Détails et pistes de réglage : [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
+notoirement bruyant et sensible au format d'échantillon ; l'étage analogique
+(atténuateur DAC → micro, adaptation HP → ADC, prise du signal squelch) est à
+faire côté matériel. La chaîne SBC + framing + files d'attente + logique
+PTT/squelch est en revanche indépendante du matériel. Détails et pistes de
+réglage : [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
 
 ## MAC Bluetooth
 

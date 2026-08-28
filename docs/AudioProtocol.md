@@ -55,12 +55,22 @@ Conséquences :
   `SbcDecoderImpl.cpp`). On réutilise le codec SBC **déjà présent dans
   `libbt.a`** (`SBC_Encoder`, `OI_CODEC_SBC_DecodeFrame`, …) ; seuls les
   en-têtes sont vendorisés dans `lib/sbc/`. Cf. `lib/sbc/README.md`.
-- **Pont audio ↔ matériel** : `src/AudioBridge.h`.
-  - Réception : `pushRadioSbc()` ← `DualRfcommServers::dispatchAudioFrame()`
-    → décodage → file PCM → I2S0 « built-in DAC » (GPIO25 / GPIO26).
-  - Émission : I2S0 « built-in ADC » (ADC1) → file PCM → encodage →
-    `sendAudioData()` / `sendAudioEnd()` sur le canal RFCOMM audio.
-  - Déclencheur d'émission : broche `AUDIO_PTT_GPIO` (`-1` = micro muet).
+- **Pont audio ↔ poste réel** : `src/AudioBridge.h`. Brochage aligné sur
+  [kv4p-ht](https://github.com/VanceVagell/kv4p-ht) (voir le README).
+  - **HTCommander → poste** (émission) : trames `AudioData` → `pushRadioSbc()`
+    → décodage SBC → file PCM → I2S0 « built-in DAC » (GPIO25) → entrée micro
+    du poste. En parallèle, la **sortie PTT (GPIO18, actif bas)** est activée
+    tant que des trames arrivent, relâchée après `AUDIO_PTT_TAIL_MS` ou sur
+    `AudioEnd`. `onTxState(true/false)` → `is_in_tx`.
+  - **poste → HTCommander** (réception) : quand l'**entrée squelch (GPIO32)**
+    indique un signal (ou la VOX sur le niveau ADC si `AUDIO_SQ_GPIO = -1`),
+    l'ADC1 (GPIO34) est capturé → encodage SBC → `sendAudioData()` ;
+    `sendAudioEnd()` à la fermeture du squelch. `onRxLevel(actif, rssi)` →
+    `is_sq` / `is_in_rx` / RSSI.
+  - Half-duplex logique : la capture ADC → HTCommander est inhibée pendant
+    l'émission vers le poste.
+  - Tâches FreeRTOS (core 1) : `audio_pump` (I2S temps réel), `audio_rx`
+    (décodage), `audio_tx` (encodage), `audio_ctl` (PTT / squelch / statut).
 - Réglages dans `src/config.h`, section 5.
 
 ## Notifications de statut liées à l'audio
@@ -72,16 +82,18 @@ squelch en fin de trafic (capture d'une VR-N76 réelle, réception APRS).
 
 Le simulateur reproduit ça :
 
-- `AudioBridge` calcule un **RSSI 0..15** à partir de `log2(|PCM|moyen)` du flux
-  SBC décodé (fenêtre ~150 ms) et appelle `onRxLevel(active, rssi)`.
-- `BenshiCommandHandler::setAudioRx()` met à jour `is_sq` / `is_in_rx` / `rssi`
-  et émet `HT_STATUS_CHANGED` **si HTCommander s'est abonné**
-  (`REGISTER_NOTIFICATION`, ce qu'il fait juste après `GET_DEV_INFO`).
+- La tâche `audio_ctl` calcule un **RSSI 0..15** = `log2(|ADC|moyen)` (niveau du
+  signal reçu par le poste) et appelle `onRxLevel(actif, rssi)` à chaque
+  changement (RSSI limité à une mise à jour / 150 ms).
+- `BenshiCommandHandler::setAudioRx()` met à jour `is_sq` / `is_in_rx` / `rssi`,
+  `setAudioTx()` met à jour `is_in_tx`, et chacun émet `HT_STATUS_CHANGED`
+  **si HTCommander s'est abonné** (`REGISTER_NOTIFICATION`, juste après
+  `GET_DEV_INFO`).
 - Le bit `is_aoc_connected` suit la connexion du canal RFCOMM audio.
 - Les écritures (`WRITE_SETTINGS` / `WRITE_RF_CH` / `SET_REGION`) émettent aussi
   `HT_STATUS_CHANGED`, juste après leur réponse.
 
-Concurrence : `setAudioRx()` tourne dans la tâche `audio_rx` et lit `RadioState`
+Concurrence : ces hooks tournent dans les tâches audio et lisent `RadioState`
 pendant que la tâche Bluetooth peut l'écrire (`WRITE_*`). Lecture potentiellement
 « déchirée » mais sans gravité — la notification suivante corrige la valeur.
 

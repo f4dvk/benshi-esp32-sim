@@ -153,7 +153,8 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define USE_DUAL_RFCOMM_SERVERS true
 
 // ----------------------------------------------------------------------
-// 5) Audio - pont Bluetooth <-> DAC / ADC internes de l'ESP32
+// 5) Audio - interface entre HTCommander (Bluetooth) et un poste réel
+//    (ex. Quansheng UV-K1) via le DAC / l'ADC internes de l'ESP32.
 // ----------------------------------------------------------------------
 // Le canal RFCOMM audio transporte du SBC. Paramètres confirmés depuis le
 // code source de HTCommander (src/lib/radio/audio_engine.dart) :
@@ -162,6 +163,18 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //   1 trame SBC = 128 échantillons PCM (256 octets) -> ~88 octets SBC
 // Framing sur le canal : délimiteurs 0x7E, échappement 0x7D (octet XOR 0x20).
 // Types de trame (1er octet) : 0x00/0x03 = audio, 0x01 = fin, 0x02 = ACK.
+//
+// BROCHAGE ALIGNÉ SUR LE PROJET kv4p-ht (ESP32 WROOM-32) :
+//   https://github.com/VanceVagell/kv4p-ht
+// afin qu'une même carte / un même adaptateur serve aux deux projets.
+//   kv4p-ht        GPIO   rôle ici
+//   PIN_AUDIO_OUT   25    DAC -> entrée micro du poste (audio TX vers le poste)
+//   PIN_AUDIO_IN    34    ADC <- sortie HP du poste  (audio RX depuis le poste)
+//   PIN_PTT         18    sortie -> keye l'émission du poste
+//   PIN_SQ          32    entrée <- "occupé / squelch ouvert" du poste
+//   PIN_PHYS_PTT1    5    bouton PTT local (optionnel)
+//   PIN_LED          2    LED d'état (optionnel)
+//   PIN_PD          19    (kv4p : power-down du module RF interne ; inutile ici)
 #define AUDIO_SAMPLE_RATE_HZ   32000
 #define AUDIO_SBC_BITPOOL      40
 
@@ -169,26 +182,47 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // Mets à false pour compiler un firmware "commandes seules" (aucun I2S/DAC/ADC).
 #define AUDIO_BRIDGE_ENABLE    true
 
-// --- Sortie "haut-parleur" : DAC interne, piloté par l'I2S en mode
-//     "built-in DAC" (DMA). En interne l'ESP32 pilote les DEUX broches DAC :
-//       GPIO25 = DAC1  (canal droit)   <- branche l'ampli ici
-//       GPIO26 = DAC2  (canal gauche)
-//     Sortie 0..3,3 V sur 8 bits : un petit ampli (PAM8302 / LM386) est
-//     indispensable, une sortie casque directe est trop faible.
+// --- Sortie audio vers le poste : DAC interne piloté par l'I2S en mode
+//     "built-in DAC" (DMA). L'ESP32 pilote les DEUX broches DAC :
+//       GPIO25 = DAC1  (= kv4p-ht PIN_AUDIO_OUT)  <- vers l'entrée micro du poste
+//       GPIO26 = DAC2
+//     Sortie 0..3,3 V sur 8 bits : prévoir un pont diviseur / atténuateur vers
+//     le niveau micro du poste (quelques mV à quelques dizaines de mV).
 #define AUDIO_DAC_ENABLE       true
 #define AUDIO_SPK_VOLUME       0.80f    // 0..1, atténuation numérique avant le DAC
 
-// --- Entrée "micro" : ADC1 interne, lu par le même I2S en mode
+// --- Entrée audio depuis le poste : ADC1 interne, lu par le même I2S en mode
 //     "built-in ADC" (DMA). ADC1 uniquement (ADC2 entre en conflit radio).
 //     Canaux ADC1 : 0=GPIO36 1=GPIO37 2=GPIO38 3=GPIO39 4=GPIO32 5=GPIO33
 //                   6=GPIO34 7=GPIO35
-//     Prévois un micro électret + préampli polarisé autour de 1,65 V (VDD/2).
+//     GPIO34 = kv4p-ht PIN_AUDIO_IN = ADC1_CHANNEL_6.
 #define AUDIO_ADC_ENABLE       true
-#define AUDIO_ADC_CHANNEL      6        // GPIO34
+#define AUDIO_ADC_CHANNEL      6        // GPIO34 (ADC1_CH6) — comme kv4p-ht
 #define AUDIO_MIC_GAIN         8.0f     // gain numérique appliqué au PCM capté
-#define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais) du micro
+#define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais)
 
-// PTT : quand cette broche passe à la masse, le micro est encodé et envoyé
-// à HTCommander. -1 = pas de bouton -> micro toujours muet (pratique pour
-// tester d'abord le sens réception seul).
-#define AUDIO_PTT_GPIO         -1
+// --- PTT : SORTIE qui keye l'émission du poste quand HTCommander émet
+//     (dès que des trames AudioData arrivent ; relâché après AUDIO_PTT_TAIL_MS
+//     sans trame, ou sur AudioEnd).
+//     kv4p-ht : PIN_PTT = 18, ACTIF À L'ÉTAT BAS (LOW = émission).
+#define AUDIO_PTT_GPIO         18       // -1 = pas de commande PTT
+#define AUDIO_PTT_ACTIVE_LOW   true
+#define AUDIO_PTT_TAIL_MS      250
+
+// --- Squelch : ENTRÉE indiquant que le poste reçoit un signal (squelch
+//     ouvert). Sert à démarrer la capture ADC -> HTCommander et à renseigner
+//     is_sq / is_in_rx (+ RSSI) dans HT_STATUS_CHANGED.
+//     kv4p-ht : PIN_SQ = 32.  -1 = pas de fil squelch -> détection au niveau
+//     du signal ADC (VOX) avec le seuil AUDIO_SQ_VOX_THRESH.
+#define AUDIO_SQ_GPIO          32       // -1 = VOX audio
+#define AUDIO_SQ_ACTIVE_LOW    true     // LOW = squelch ouvert (signal présent)
+#define AUDIO_SQ_PULLUP        true
+#define AUDIO_SQ_VOX_THRESH    600      // |PCM| moyen déclenchant la VOX (si SQ=-1)
+
+// --- Bouton PTT local (optionnel) : force la capture ADC -> HTCommander,
+//     comme si le squelch était ouvert. kv4p-ht : 5 ou 33.
+#define AUDIO_PHYS_PTT_GPIO    -1       // ex. 5 ; actif à la masse
+
+// --- LED d'état (optionnel) : allumée pendant TX vers le poste, clignote en
+//     RX depuis le poste. kv4p-ht : 2 (LED interne).
+#define AUDIO_STATUS_LED_GPIO  -1       // ex. 2

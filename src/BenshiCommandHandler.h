@@ -106,7 +106,7 @@ public:
             outMsg.body = BenshiReplies::regionName(state_, regionId);
 
         } else if (in.command == GET_HT_STATUS) {
-            outMsg.body = BenshiReplies::htStatus(state_, false, sqOpen_.load(),
+            outMsg.body = BenshiReplies::htStatus(state_, inTx_.load(), sqOpen_.load(),
                                                   rssi_.load(), aocConnected_.load());
 
         } else if (in.command == SET_PHONE_STATUS) {
@@ -130,12 +130,18 @@ public:
     }
 
     // --- Hooks du pont audio (contexte tâche) ---------------------------------
-    // Réception audio en cours : squelch/RX ouverts + RSSI 0..15 dérivé du PCM.
+    // Réception depuis le poste : squelch/RX ouverts + RSSI 0..15 dérivé de l'ADC.
     void setAudioRx(bool active, uint8_t rssi) {
         bool changed = (active != sqOpen_.load()) || (rssi != rssi_.load());
         sqOpen_.store(active);
         rssi_.store(active ? rssi : 0);
         if (changed) emitHtStatusChanged();
+    }
+    // Émission vers le poste (HTCommander envoie de l'audio) : is_in_tx.
+    void setAudioTx(bool tx) {
+        if (tx == inTx_.load()) return;
+        inTx_.store(tx);
+        emitHtStatusChanged();
     }
     // Canal audio RFCOMM connecté / déconnecté.
     void setAudioConnected(bool c) {
@@ -151,7 +157,7 @@ public:
         m.command_group = CommandGroup::BASIC;
         m.is_reply      = false;
         m.command       = BasicCommand::EVENT_NOTIFICATION;
-        m.body = BenshiReplies::htStatusChangedEvent(state_, false, sqOpen_.load(),
+        m.body = BenshiReplies::htStatusChangedEvent(state_, inTx_.load(), sqOpen_.load(),
                                                      rssi_.load(), aocConnected_.load());
         sink_(m);
     }
@@ -166,4 +172,5 @@ private:
     std::atomic<bool>    sqOpen_{false};
     std::atomic<uint8_t> rssi_{0};
     std::atomic<bool>    aocConnected_{false};
+    std::atomic<bool>    inTx_{false};
 };

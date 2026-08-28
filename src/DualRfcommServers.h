@@ -141,10 +141,12 @@ public:
         //    trames sur le canal RFCOMM audio via sendAudioData()/sendAudioEnd().
         audio_.onTxFrame([this](const uint8_t* sbc, size_t len) { sendAudioData(sbc, len); });
         audio_.onTxEnd([this]() { sendAudioEnd(); });
-        // Niveau de reception -> is_sq / is_in_rx / rssi de la trame de statut.
+        // Reception depuis le poste -> is_sq / is_in_rx / rssi.
         audio_.onRxLevel([this](bool active, uint8_t rssi) {
             handler_.setAudioRx(active, rssi);
         });
+        // Emission vers le poste (HTCommander envoie de l'audio) -> is_in_tx.
+        audio_.onTxState([this](bool tx) { handler_.setAudioTx(tx); });
         if (!audio_.begin()) {
             Serial.println("[SPP-DUAL] AVERTISSEMENT: pont audio non demarre (commandes OK).");
         }
@@ -317,6 +319,7 @@ private:
                     audioHandle_ = 0; audioRxFrame_.clear();
                     handler_.setAudioConnected(false);
                     handler_.setAudioRx(false, 0);
+                    handler_.setAudioTx(false);
                 }
                 if (param->close.handle == pendingConn_) { pendingConn_ = 0; pendingListen_ = 0; }
                 Serial.println("[SPP-DUAL] Deconnexion d'un canal RFCOMM");

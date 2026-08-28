@@ -16,34 +16,41 @@
 #include "driver/adc.h"
 
 // ============================================================================
-// Pont audio : canal RFCOMM audio (SBC) <-> DAC / ADC internes de l'ESP32.
+// Pont audio : canal RFCOMM audio (SBC, Bluetooth) <-> poste réel (ex. Quansheng
+// UV-K1) via le DAC / l'ADC internes de l'ESP32. Brochage aligné sur kv4p-ht
+// (voir config.h section 5).
 //
-//   Reception  (HTCommander -> HP)  : pushRadioSbc() -> decodeur SBC -> file
-//     PCM de lecture -> I2S "built-in DAC" (GPIO25 / GPIO26).
-//   Emission   (micro -> HTCommander): I2S "built-in ADC" (ADC1) -> file PCM
-//     micro -> encodeur SBC -> onTxFrame() (trames AudioData) ; onTxEnd() a
-//     la fin d'un appui PTT.
+//   HTCommander -> poste (EMISSION) :
+//     trames AudioData -> pushRadioSbc() -> décodeur SBC -> file PCM -> DAC
+//     (GPIO25) -> entrée micro du poste. En parallèle : sortie PTT (GPIO18)
+//     activée tant que des trames arrivent, relâchée après AUDIO_PTT_TAIL_MS.
 //
-// Le meme peripherique I2S0 fait ADC + DAC en full-duplex (seul I2S0 est cable
-// aux ADC/DAC internes de l'ESP32). Sample rate commun : AUDIO_SAMPLE_RATE_HZ.
-// Modele : exemple ESP-IDF "i2s_adc_dac".
+//   poste -> HTCommander (RECEPTION) :
+//     quand le squelch du poste s'ouvre (entrée SQ GPIO32, ou VOX si SQ=-1) :
+//     ADC (GPIO34) <- sortie HP du poste -> encodeur SBC -> onTxFrame()
+//     (trames AudioData) ; onTxEnd() (AudioEnd) quand le squelch se referme.
+//     onRxLevel(actif, rssi) alimente is_sq / is_in_rx / RSSI du statut.
 //
-// ATTENTION : NON VALIDE SUR MATERIEL. Le mode ADC+DAC interne simultane de
-// l'ESP32 est connu pour etre bruyant / sensible, et le brochage analogique
-// (ampli HP, preampli + biais micro) est a faire cote materiel. Toute la
-// chaine SBC + framing + files est en revanche independante du materiel.
+// Le même I2S0 fait ADC + DAC en full-duplex (seul I2S0 est câblé aux ADC/DAC
+// internes). Half-duplex logique : pendant l'émission vers le poste, la capture
+// ADC -> HTCommander est inhibée.
+//
+// ATTENTION : mode ADC+DAC interne simultané non validé sur matériel ; l'étage
+// analogique (atténuateur DAC->micro, adaptation HP->ADC) est à faire côté
+// matériel. La chaîne SBC + framing + files est indépendante du matériel.
 // ============================================================================
 
 class AudioBridge {
 public:
-    using TxFrameFn = std::function<void(const uint8_t*, size_t)>;
-    using TxEndFn   = std::function<void()>;
-    // (reception audio active ?, RSSI simule 0..15 derive du niveau PCM)
-    using RxLevelFn = std::function<void(bool, uint8_t)>;
+    using TxFrameFn = std::function<void(const uint8_t*, size_t)>;   // SBC -> HTCommander
+    using TxEndFn   = std::function<void()>;                         // AudioEnd -> HTCommander
+    using RxLevelFn = std::function<void(bool, uint8_t)>;            // (RX poste actif ?, RSSI 0..15)
+    using TxStateFn = std::function<void(bool)>;                     // émission vers le poste ?
 
     void onTxFrame(TxFrameFn fn) { txFrameCb_ = std::move(fn); }
     void onTxEnd(TxEndFn fn)     { txEndCb_   = std::move(fn); }
     void onRxLevel(RxLevelFn fn) { rxLevelCb_ = std::move(fn); }
+    void onTxState(TxStateFn fn) { txStateCb_ = std::move(fn); }
 
     bool begin() {
 #if !AUDIO_BRIDGE_ENABLE
@@ -58,46 +65,48 @@ public:
         Serial.printf("[AUDIO] SBC pret (trame ~%d octets, %u ech. PCM / trame)\n",
                       encoder_.frameLen(), (unsigned)sbc::kSamplesPerFrame);
 
+        setupGpio();
         if (!startI2s()) return false;
-
-#if (AUDIO_PTT_GPIO >= 0)
-        pinMode(AUDIO_PTT_GPIO, INPUT_PULLUP);
-        Serial.printf("[AUDIO] PTT sur GPIO%d (actif = masse)\n", AUDIO_PTT_GPIO);
-#else
-        Serial.println("[AUDIO] Pas de PTT (AUDIO_PTT_GPIO=-1) : micro muet, reception seule");
-#endif
 
         xTaskCreatePinnedToCore(&AudioBridge::pumpTrampoline, "audio_pump", 4096, this, 6, &pumpTask_, 1);
         xTaskCreatePinnedToCore(&AudioBridge::rxTrampoline,   "audio_rx",   4096, this, 5, &rxTask_,   1);
         xTaskCreatePinnedToCore(&AudioBridge::txTrampoline,   "audio_tx",   4096, this, 5, &txTask_,   1);
+        xTaskCreatePinnedToCore(&AudioBridge::ctlTrampoline,  "audio_ctl",  3072, this, 4, &ctlTask_,  1);
         Serial.println("[AUDIO] Pont audio demarre");
         return true;
 #endif
     }
 
-    // --- Reception : appele depuis le dispatch RFCOMM (trame type 0x00/0x03) ---
+    // Trame AudioData reçue de HTCommander (type 0x00 / 0x03) : audio à émettre
+    // sur le poste. Appelé depuis le callback Bluetooth.
     void pushRadioSbc(const uint8_t* sbc, size_t len) {
 #if AUDIO_BRIDGE_ENABLE
         if (!sbcIn_ || !len) return;
-        rxLastMs_.store(millis());
-        // Depot non bloquant : si le buffer est plein on laisse tomber (mieux
-        // vaut un trou audio qu'un blocage du callback Bluetooth).
-        xStreamBufferSend(sbcIn_, sbc, len, 0);
+        lastRadioSbcMs_.store(millis());
+        xStreamBufferSend(sbcIn_, sbc, len, 0);   // dépôt non bloquant
 #endif
     }
 
-    // Fin de flux annoncee par HTCommander (trame type 0x01).
-    void radioAudioEnd() {}
+    // Trame AudioEnd reçue de HTCommander (type 0x01) : fin d'émission.
+    void radioAudioEnd() {
+#if AUDIO_BRIDGE_ENABLE
+        // Relâche le PTT après la traîne, sans prolonger davantage.
+        uint32_t t = millis();
+        if (t > AUDIO_PTT_TAIL_MS) t -= (AUDIO_PTT_TAIL_MS - 40);
+        lastRadioSbcMs_.store(t);
+#endif
+    }
 
-    bool micTransmitting() const { return txActive_.load(); }
+    bool txToRadio() const   { return hcTxActive_.load(); }
+    bool rxFromRadio() const  { return micGateOpen_.load(); }
 
 private:
-    // ---------------- File PCM (SPSC lock-free, capacite = puissance de 2) --
+    // ---------------- File PCM (SPSC lock-free, capacité = puissance de 2) --
     template <size_t N>
     struct PcmRing {
         int16_t buf[N];
-        std::atomic<uint32_t> head{0};   // ecrit par le producteur
-        std::atomic<uint32_t> tail{0};   // ecrit par le consommateur
+        std::atomic<uint32_t> head{0};
+        std::atomic<uint32_t> tail{0};
         size_t write(const int16_t* s, size_t n) {
             uint32_t h = head.load(std::memory_order_relaxed);
             uint32_t t = tail.load(std::memory_order_acquire);
@@ -127,6 +136,56 @@ private:
     static constexpr size_t kPlayRing   = 8192;   // ~256 ms @ 32 kHz
     static constexpr size_t kMicRing    = 4096;
 
+    // ---------------- GPIO (PTT / SQ / bouton / LED) ---------------------
+    void setupGpio() {
+#if (AUDIO_PTT_GPIO >= 0)
+        pinMode(AUDIO_PTT_GPIO, OUTPUT);
+        pttWrite(false);
+        Serial.printf("[AUDIO] PTT sortie GPIO%d (actif %s)\n",
+                      AUDIO_PTT_GPIO, AUDIO_PTT_ACTIVE_LOW ? "BAS" : "HAUT");
+#endif
+#if (AUDIO_SQ_GPIO >= 0)
+        pinMode(AUDIO_SQ_GPIO, AUDIO_SQ_PULLUP ? INPUT_PULLUP : INPUT);
+        Serial.printf("[AUDIO] Squelch entree GPIO%d (ouvert = %s)\n",
+                      AUDIO_SQ_GPIO, AUDIO_SQ_ACTIVE_LOW ? "BAS" : "HAUT");
+#else
+        Serial.printf("[AUDIO] Pas de fil squelch -> VOX (seuil %d)\n", AUDIO_SQ_VOX_THRESH);
+#endif
+#if (AUDIO_PHYS_PTT_GPIO >= 0)
+        pinMode(AUDIO_PHYS_PTT_GPIO, INPUT_PULLUP);
+#endif
+#if (AUDIO_STATUS_LED_GPIO >= 0)
+        pinMode(AUDIO_STATUS_LED_GPIO, OUTPUT);
+        digitalWrite(AUDIO_STATUS_LED_GPIO, LOW);
+#endif
+    }
+
+    static void pttWrite(bool tx) {
+#if (AUDIO_PTT_GPIO >= 0)
+        bool low = tx ? AUDIO_PTT_ACTIVE_LOW : !AUDIO_PTT_ACTIVE_LOW;
+        digitalWrite(AUDIO_PTT_GPIO, low ? LOW : HIGH);
+#else
+        (void)tx;
+#endif
+    }
+
+    bool squelchHwOpen() {
+#if (AUDIO_SQ_GPIO >= 0)
+        int v = digitalRead(AUDIO_SQ_GPIO);
+        return AUDIO_SQ_ACTIVE_LOW ? (v == LOW) : (v == HIGH);
+#else
+        return vox_;   // mis à jour depuis adcLevel_ dans la tâche de contrôle
+#endif
+    }
+
+    static bool physPttPressed() {
+#if (AUDIO_PHYS_PTT_GPIO >= 0)
+        return digitalRead(AUDIO_PHYS_PTT_GPIO) == LOW;
+#else
+        return false;
+#endif
+    }
+
     // ---------------- I2S ------------------------------------------------
     bool startI2s() {
         int mode = I2S_MODE_MASTER;
@@ -153,13 +212,11 @@ private:
             Serial.printf("[AUDIO] i2s_driver_install -> %s\n", esp_err_to_name(e));
             return false;
         }
-
 #if AUDIO_ADC_ENABLE
         i2s_set_adc_mode(ADC_UNIT_1, (adc1_channel_t)AUDIO_ADC_CHANNEL);
         adc1_config_channel_atten((adc1_channel_t)AUDIO_ADC_CHANNEL, ADC_ATTEN_DB_12);
 #endif
-        // pin = NULL -> initialise les 2 canaux DAC internes (GPIO25 + GPIO26).
-        i2s_set_pin(I2S_NUM_0, nullptr);
+        i2s_set_pin(I2S_NUM_0, nullptr);   // NULL -> DAC interne GPIO25 + GPIO26
 #if AUDIO_DAC_ENABLE
         i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
 #endif
@@ -170,51 +227,55 @@ private:
         return true;
     }
 
-    // ---------------- Tache "pompe" I2S (timing temps reel) --------------
+    // ---------------- Tâche "pompe" I2S (timing temps réel) -------------
     static void pumpTrampoline(void* self) { static_cast<AudioBridge*>(self)->pumpLoop(); }
     void pumpLoop() {
         int16_t  play[kFrame];
-        uint16_t dac[kFrame * 2];        // stereo 16 bits pour le DAC
+        uint16_t dac[kFrame * 2];
         uint16_t adc[kFrame];
         int16_t  mic[kFrame];
         size_t   n = 0;
 
         for (;;) {
 #if AUDIO_ADC_ENABLE
-            // ---- Lecture ADC (micro) : cadence aussi la boucle ----
             if (i2s_read(I2S_NUM_0, adc, sizeof(adc), &n, portMAX_DELAY) == ESP_OK && n) {
                 size_t cnt = n / sizeof(uint16_t);
+                uint32_t absSum = 0;
+                bool gate = micGateOpen_.load();
                 for (size_t i = 0; i < cnt; i++) {
-                    int raw = adc[i] & 0x0FFF;               // 12 bits utiles
+                    int raw = adc[i] & 0x0FFF;                 // 12 bits utiles
 #if AUDIO_MIC_DC_TRACK
-                    micDc_ += (raw - micDc_) * 0.0015f;      // suivi lent du biais
+                    micDc_ += (raw - micDc_) * 0.0015f;        // suivi lent du biais
 #else
                     micDc_ = 2048.0f;
 #endif
                     float s = (raw - micDc_) * (AUDIO_MIC_GAIN * 16.0f);
-                    mic[i] = s > 32767.f ? 32767 : (s < -32768.f ? -32768 : (int16_t)s);
+                    int16_t v = s > 32767.f ? 32767 : (s < -32768.f ? -32768 : (int16_t)s);
+                    mic[i] = v;
+                    absSum += (uint32_t)(v < 0 ? -v : v);
                 }
-                micRing_.write(mic, cnt);
+                if (cnt) {
+                    uint32_t mean = absSum / cnt;              // |PCM| moyen 0..32767
+                    // Lissage ~30 ms puis publication pour la VOX / le RSSI.
+                    adcEnv_ += ((float)mean - adcEnv_) * 0.25f;
+                    adcLevel_.store((uint32_t)adcEnv_);
+                }
+                if (gate) micRing_.write(mic, cnt);           // capture seulement si RX ouvert
             }
 #endif
-            // ---- Ecriture DAC (haut-parleur) ----
             size_t got = playRing_.read(play, kFrame);
             for (size_t i = 0; i < kFrame; i++) {
                 int32_t p = (i < got) ? (int32_t)(play[i] * AUDIO_SPK_VOLUME) : 0;
                 uint16_t u8 = (uint16_t)(((p >> 8) + 128) & 0xFF);   // 8 bits DAC
                 uint16_t w  = (uint16_t)(u8 << 8);
-                dac[2 * i]     = w;   // canal gauche  (GPIO26)
-                dac[2 * i + 1] = w;   // canal droit   (GPIO25)
+                dac[2 * i]     = w;   // GPIO26
+                dac[2 * i + 1] = w;   // GPIO25
             }
             i2s_write(I2S_NUM_0, dac, sizeof(dac), &n, portMAX_DELAY);
-
-#if !AUDIO_ADC_ENABLE
-            // Sans ADC pour cadencer, i2s_write suffit (bloque sur le DMA TX).
-#endif
         }
     }
 
-    // ---------------- Tache decodage SBC -> file de lecture -------------
+    // ---------------- Tâche décodage SBC -> file de lecture (-> DAC) ----
     static void rxTrampoline(void* self) { static_cast<AudioBridge*>(self)->rxLoop(); }
     void rxLoop() {
         static constexpr size_t kAcc = 1024;
@@ -229,7 +290,6 @@ private:
             }
             if (accLen == 0) continue;
 
-            // Decode autant de trames completes que possible.
             size_t offset = 0;
             for (;;) {
                 size_t inLeft = accLen - offset;
@@ -237,63 +297,24 @@ private:
                 size_t samples = decoder_.decode(acc + offset, &inLeft, pcm,
                                                  sizeof(pcm) / sizeof(pcm[0]));
                 size_t consumed = (accLen - offset) - inLeft;
-                if (samples) {
-                    playRing_.write(pcm, samples);
-                    for (size_t i = 0; i < samples; i++) {
-                        int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
-                        lvlAccum_ += (uint32_t)v;
-                    }
-                    lvlCount_ += samples;
-                }
-                if (consumed == 0) break;          // trame incomplete : on attend la suite
+                if (samples) playRing_.write(pcm, samples);
+                if (consumed == 0) break;
                 offset += consumed;
             }
-            // Compacte le reliquat en tete de buffer.
             accLen -= offset;
             if (accLen && offset) memmove(acc, acc + offset, accLen);
-            if (accLen == kAcc) accLen = 0;        // garde-fou : jamais de blocage
-
-            updateRxLevel();
+            if (accLen == kAcc) accLen = 0;
         }
     }
 
-    // RSSI simule + etat squelch, pousses via rxLevelCb_ (throttle ~150 ms).
-    void updateRxLevel() {
-        uint32_t now = millis();
-        bool active = (now - rxLastMs_.load()) < 300;
-        if (active == rxWasActive_ && now - lastLvlMs_ < 150) return;
-
-        uint8_t rssi = 0;
-        if (active && lvlCount_) {
-            uint32_t mean = (uint32_t)(lvlAccum_ / lvlCount_);   // |PCM| moyen, 0..32767
-            float l = log2f((float)mean + 1.0f);                 // ~0..15
-            rssi = l >= 15.f ? 15 : (uint8_t)(l + 0.5f);
-            if (rssi < 1) rssi = 1;                              // actif => au moins 1
-        }
-        lvlAccum_ = 0;
-        lvlCount_ = 0;
-        lastLvlMs_ = now;
-
-        if (active != rxWasActive_ || rssi != lastRssi_) {
-            rxWasActive_ = active;
-            lastRssi_    = rssi;
-            if (rxLevelCb_) rxLevelCb_(active, rssi);
-        }
-    }
-
-    // ---------------- Tache encodage micro -> onTxFrame ----------------
+    // ---------------- Tâche encodage micro -> onTxFrame (-> HTCommander) --
     static void txTrampoline(void* self) { static_cast<AudioBridge*>(self)->txLoop(); }
     void txLoop() {
         int16_t frame[kFrame];
         uint8_t sbcOut[sbc::kMaxSbcFrameLen];
 
         for (;;) {
-            if (!pttPressed()) {
-                if (txActive_.exchange(false) && txEndCb_) txEndCb_();
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
-            }
-            txActive_.store(true);
+            if (!micGateOpen_.load()) { vTaskDelay(pdMS_TO_TICKS(15)); continue; }
             if (micRing_.available() < kFrame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
             micRing_.read(frame, kFrame);
             size_t len = encoder_.encodeFrame(frame, sbcOut, sizeof(sbcOut));
@@ -301,15 +322,76 @@ private:
         }
     }
 
-    bool pttPressed() const {
-#if (AUDIO_PTT_GPIO >= 0)
-        return digitalRead(AUDIO_PTT_GPIO) == LOW;
-#else
-        return false;
+    // ---------------- Tâche de contrôle : PTT, squelch, statut ----------
+    static void ctlTrampoline(void* self) { static_cast<AudioBridge*>(self)->ctlLoop(); }
+    void ctlLoop() {
+        uint32_t sqSinceMs  = 0;     // anti-rebond squelch
+        bool     sqStable   = false;
+        bool     txPrev     = false;
+        bool     rxGatePrev = false;
+        uint32_t lastRssiMs = 0;
+        uint8_t  rssiPrev   = 0;
+
+        for (;;) {
+            uint32_t now = millis();
+
+            // --- PTT vers le poste : actif tant que HTCommander envoie ---
+            bool tx = (now - lastRadioSbcMs_.load()) < (uint32_t)AUDIO_PTT_TAIL_MS;
+            if (tx != txPrev) {
+                txPrev = tx;
+                hcTxActive_.store(tx);
+                pttWrite(tx);
+                if (txStateCb_) txStateCb_(tx);
+            }
+
+            // --- VOX (si pas de fil squelch) : hystérésis + traîne 400 ms ---
+#if (AUDIO_SQ_GPIO < 0)
+            uint32_t lvl = adcLevel_.load();
+            if (lvl > (uint32_t)(AUDIO_SQ_VOX_THRESH / 2)) voxLoudMs_ = now;
+            if (!vox_ && lvl > (uint32_t)AUDIO_SQ_VOX_THRESH) vox_ = true;
+            else if (vox_ && now - voxLoudMs_ > 400)          vox_ = false;
 #endif
+            // --- Squelch débruité (25 ms) ---
+            bool sqRaw = squelchHwOpen() || physPttPressed();
+            if (sqRaw != sqStable) {
+                if (sqSinceMs == 0) sqSinceMs = now;
+                else if (now - sqSinceMs > 25) { sqStable = sqRaw; sqSinceMs = 0; }
+            } else {
+                sqSinceMs = 0;
+            }
+
+            // --- Capture ADC -> HTCommander (jamais pendant l'émission) ---
+            bool rxGate = sqStable && !tx;
+            bool rxOpened  = rxGate && !rxGatePrev;
+            bool rxClosed  = !rxGate && rxGatePrev;
+            rxGatePrev = rxGate;
+            if (rxOpened || rxClosed) micGateOpen_.store(rxGate);
+            if (rxClosed && txEndCb_) txEndCb_();               // AudioEnd -> HTCommander
+
+            // --- RSSI 0..15 dérivé du niveau ADC ---
+            if (rxGate) {
+                float l = log2f((float)adcLevel_.load() + 1.0f);
+                uint8_t rssi = l >= 15.f ? 15 : (uint8_t)(l + 0.5f);
+                if (rssi < 1) rssi = 1;
+                if (rxOpened || (rssi != rssiPrev && now - lastRssiMs > 150)) {
+                    rssiPrev = rssi; lastRssiMs = now;
+                    if (rxLevelCb_) rxLevelCb_(true, rssi);
+                }
+            } else if (rxClosed) {
+                rssiPrev = 0;
+                if (rxLevelCb_) rxLevelCb_(false, 0);
+            }
+
+            // --- LED d'état : fixe en émission, clignote en réception ---
+#if (AUDIO_STATUS_LED_GPIO >= 0)
+            bool led = tx || (rxGate && ((now / 120) & 1));
+            digitalWrite(AUDIO_STATUS_LED_GPIO, led ? HIGH : LOW);
+#endif
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 
-    // ---------------- Donnees membres ---------------------------------
+    // ---------------- Données membres ---------------------------------
     sbc::Decoder decoder_;
     sbc::Encoder encoder_;
 
@@ -317,20 +399,20 @@ private:
     PcmRing<kPlayRing> playRing_;
     PcmRing<kMicRing>  micRing_;
 
-    TaskHandle_t pumpTask_ = nullptr, rxTask_ = nullptr, txTask_ = nullptr;
+    TaskHandle_t pumpTask_ = nullptr, rxTask_ = nullptr, txTask_ = nullptr, ctlTask_ = nullptr;
 
     TxFrameFn txFrameCb_;
     TxEndFn   txEndCb_;
     RxLevelFn rxLevelCb_;
+    TxStateFn txStateCb_;
 
-    std::atomic<uint32_t> rxLastMs_{0};
-    std::atomic<bool>     txActive_{false};
-    float                 micDc_ = 2048.0f;
+    std::atomic<uint32_t> lastRadioSbcMs_{0};   // dernier AudioData reçu de HTCommander
+    std::atomic<uint32_t> adcLevel_{0};         // |PCM| moyen lissé (0..32767)
+    std::atomic<bool>     hcTxActive_{false};   // émission vers le poste en cours
+    std::atomic<bool>     micGateOpen_{false};  // capture ADC -> HTCommander ouverte
 
-    // Etat "S-metre" simule (tache audio_rx uniquement).
-    uint64_t lvlAccum_   = 0;
-    uint32_t lvlCount_   = 0;
-    uint32_t lastLvlMs_  = 0;
-    uint8_t  lastRssi_   = 0;
-    bool     rxWasActive_ = false;
+    float    micDc_ = 2048.0f;
+    float    adcEnv_ = 0.0f;
+    bool     vox_ = false;
+    uint32_t voxLoudMs_ = 0;
 };
