@@ -166,6 +166,13 @@ Quand la radio est sur le canal nommé `TNC_CHANNEL_NAME` (« APRS »), l'ESP fa
   déjà fourni par arduino-esp32. `-DAFSK_SAMPLE_RATE=32000`.
 - Hors canal APRS : `dataChanActive_` = false → pont audio en phonie SBC normal.
 - Tâches : `tnc_rx` (démod), `tnc_tx` (modulation, bloquante = temps réel).
+- **Allocation différée** : le modem, les files et les tâches ne sont créés
+  (`tncStart`) qu'une fois HTCommander connecté ET sur le canal APRS — le heap
+  est serré (Bluedroid), il faut que la connexion BT ait sa part d'abord.
+  Libérés (`tncStop`) en quittant le canal ou à la déconnexion. Sur échec
+  d'allocation : on reste en phonie (dégradé mais connecté). Trace `heap=` dans
+  `[DBG]`, `[TNC] actif (heap libre N)`.
+- Pas de FEC (FX.25). Comme le chemin TNC matériel de HTCommander lui-même.
 
 Côté HTCommander : **mettre le modem logiciel APRS sur « Off »** (sinon il
 module/démodule lui-même via l'audio au lieu d'utiliser notre TNC). Le modem

@@ -38,6 +38,7 @@ public:
     void onTxDone(TxDoneFn f)   { txDoneCb_ = std::move(f); }
 
     bool begin();
+    void end();
     void feedRxAudio(const int16_t* pcm, size_t n);
     void txAx25(const uint8_t* frame, size_t len);
     bool transmitting() const { return txBusy_; }

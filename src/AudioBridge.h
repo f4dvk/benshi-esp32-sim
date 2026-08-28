@@ -81,7 +81,7 @@ public:
 #else
         sbcIn_ = xStreamBufferCreate(kSbcInBytes, 1);
         if (!sbcIn_) { Serial.println("[AUDIO] ERREUR: stream buffer SBC"); return false; }
-        dataTxSb_ = xStreamBufferCreate(8192, 1);   // ~128 ms de PCM du modulateur AFSK
+        dataTxSb_ = xStreamBufferCreate(4096, 1);   // ~64 ms de PCM du modulateur AFSK
         if (!dataTxSb_) { Serial.println("[AUDIO] ERREUR: stream buffer TNC"); return false; }
 
         if (!decoder_.begin()) { Serial.println("[AUDIO] ERREUR: init decodeur SBC"); return false; }

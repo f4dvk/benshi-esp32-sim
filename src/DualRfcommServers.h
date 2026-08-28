@@ -172,7 +172,7 @@ public:
 #if TNC_ENABLE
         // 8) TNC AX.25 / AFSK 1200 pour le canal donnees "APRS".
         tncSetup();
-        tncUpdateChannel();
+        tncReconcile();
 #endif
         return true;
     }
@@ -193,7 +193,7 @@ public:
         handler_.pollRf();
         flushAudioCoalesce();
 #if TNC_ENABLE
-        tncUpdateChannel();
+        tncReconcile();
 #endif
 
         // Filet de securite : HTCommander a ouvert un 2e canal RFCOMM mais
@@ -219,7 +219,7 @@ public:
                 "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz clip=%lu | "
                 "RX<-HTC: cmd=%u audioData=%uf/%uo types=0x%03X | "
                 "mic: enc=%u SBC/s -> spp chunks sent=%u drop~=%u qlen=%u | "
-                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu%s\n",
+                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu heap=%u%s\n",
                 (unsigned long)cmdHandle_, (unsigned long)audioHandle_,
                 (unsigned long)pendingConn_, (int)audioCong_,
                 audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps, (unsigned long)clip,
@@ -227,8 +227,9 @@ public:
                 enc, dbgAudioSent_, dbgAudioDrop_, (unsigned)audioTxQ_.size(),
                 (int)audio_.txToRadio(), (int)audio_.squelchRaw(),
                 (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel(),
+                (unsigned)ESP.getFreeHeap(),
 #if TNC_ENABLE
-                dataChanActive_ ? " | TNC=DATA(AFSK)" : "");
+                tncRunning_ ? " | TNC=DATA(AFSK)" : "");
 #else
                 "");
 #endif
@@ -721,48 +722,94 @@ private:
     int      tncTxNextFrag_ = 0;
     StreamBufferHandle_t tncTxQ_ = nullptr;      // trames AX.25 completes -> tache TX
     StreamBufferHandle_t tncRxSb_ = nullptr;     // PCM ADC -> tache demod
+    volatile bool tncRunning_ = false;
+    TaskHandle_t tncTxTask_ = nullptr, tncRxTask_ = nullptr;
 
     bool tncOn() const { return dataChanActive_; }
 
+    // Ne fait QUE brancher les callbacks (aucune allocation). Le modem, les
+    // files et les tâches ne sont créés que quand la radio passe sur le canal
+    // "APRS" (tncStart) et sont libérés en la quittant (tncStop) -> un firmware
+    // en phonie ne paie rien pour le TNC (heap serré avec Bluedroid).
     void tncSetup() {
-        tncTxQ_  = xStreamBufferCreate(2048, 1);
-        tncRxSb_ = xStreamBufferCreate(8192, 1);
-        if (!tnc_.begin()) { Serial.println("[TNC] init modem AFSK KO"); return; }
         tnc_.onRxFrame([this](const uint8_t* ax25, size_t len) { onTncRxFrame(ax25, len); });
         tnc_.onTxAudio([this](const int16_t* pcm, size_t n)   { audio_.dataTxAudio(pcm, n); });
         tnc_.onTxDone([this]() { audio_.dataTxEnd(); });
-        // La pompe I2S (temps réel) ne fait que déposer le PCM ; le démodulateur
-        // (FIR, coûteux) tourne dans sa propre tâche.
         audio_.onDataRxAudio([this](const int16_t* pcm, size_t n) {
-            if (dataChanActive_ && tncRxSb_)
+            if (tncRunning_ && tncRxSb_)
                 xStreamBufferSend(tncRxSb_, pcm, n * sizeof(int16_t), 0);
         });
-        handler_.onDataTx([this](const uint8_t* body, size_t len) { onHtSendData(body, len); });
+        handler_.onDataTx([this](const uint8_t* body, size_t len) {
+            if (tncRunning_) onHtSendData(body, len);
+        });
+        Serial.printf("[TNC] callbacks prets ; s'active sur le canal \"%s\"\n", TNC_CHANNEL_NAME);
+    }
+
+    void tncStart() {
+        if (tncRunning_) return;
+        Serial.printf("[TNC] demarrage... (heap libre %u)\n", (unsigned)ESP.getFreeHeap());
+        tncTxQ_  = xStreamBufferCreate(512, 1);
+        tncRxSb_ = xStreamBufferCreate(2048, 1);
+        if (!tncTxQ_ || !tncRxSb_ || !tnc_.begin()) {
+            Serial.println("[TNC] ECHEC init (heap ?) -> reste en phonie");
+            tncTeardown();
+            return;
+        }
+        tncRunning_ = true;
         xTaskCreatePinnedToCore(&DualRfcommServers::tncTxTrampoline, "tnc_tx",
-                                8192, this, 4, nullptr, 1);
+                                4096, this, 4, &tncTxTask_, 1);
         xTaskCreatePinnedToCore(&DualRfcommServers::tncRxTrampoline, "tnc_rx",
-                                8192, this, 5, nullptr, 1);
-        Serial.printf("[TNC] pret ; actif sur le canal \"%s\"\n", TNC_CHANNEL_NAME);
+                                4608, this, 5, &tncRxTask_, 1);
+        Serial.printf("[TNC] actif (heap libre %u)\n", (unsigned)ESP.getFreeHeap());
+    }
+
+    void tncStop() {
+        if (!tncRunning_) return;
+        tncRunning_ = false;                        // les taches sortent puis s'auto-suppriment
+        for (int i = 0; i < 25 && (tncTxTask_ || tncRxTask_); i++) vTaskDelay(pdMS_TO_TICKS(20));
+        tnc_.end();
+        if (tncTxQ_)  { vStreamBufferDelete(tncTxQ_);  tncTxQ_  = nullptr; }
+        if (tncRxSb_) { vStreamBufferDelete(tncRxSb_); tncRxSb_ = nullptr; }
+        tncTxAccum_ = std::vector<uint8_t>();
+        tncTxNextFrag_ = 0;
+        Serial.printf("[TNC] arrete (heap libre %u)\n", (unsigned)ESP.getFreeHeap());
+    }
+
+    void tncTeardown() {   // uniquement sur echec de tncStart (taches pas encore creees)
+        tnc_.end();
+        if (tncTxQ_)  { vStreamBufferDelete(tncTxQ_);  tncTxQ_  = nullptr; }
+        if (tncRxSb_) { vStreamBufferDelete(tncRxSb_); tncRxSb_ = nullptr; }
     }
 
     static void tncRxTrampoline(void* self) { static_cast<DualRfcommServers*>(self)->tncRxLoop(); }
     void tncRxLoop() {
-        int16_t pcm[256];
-        for (;;) {
+        int16_t pcm[128];
+        while (tncRunning_) {
             size_t br = xStreamBufferReceive(tncRxSb_, pcm, sizeof(pcm), pdMS_TO_TICKS(100));
-            if (br >= sizeof(int16_t)) tnc_.feedRxAudio(pcm, br / sizeof(int16_t));
+            if (br >= sizeof(int16_t) && tncRunning_) tnc_.feedRxAudio(pcm, br / sizeof(int16_t));
         }
+        tncRxTask_ = nullptr;
+        vTaskDelete(nullptr);
     }
 
-    // Suit le canal actif : bascule le pont audio en mode données sur "APRS".
-    void tncUpdateChannel() {
-        bool on = handler_.activeChannelName() == String(TNC_CHANNEL_NAME);
-        if (on == dataChanActive_) return;
-        dataChanActive_ = on;
-        audio_.setDataMode(on);
-        Serial.printf("[TNC] canal \"%s\" %s -> %s\n", TNC_CHANNEL_NAME,
-                      on ? "actif" : "quitte",
-                      on ? "mode DONNEES (AFSK)" : "mode PHONIE (SBC)");
+    // Le TNC ne démarre qu'une fois HTCommander connecté (le canal Bluetooth
+    // doit avoir sa part du heap AVANT le modem AFSK) et sur le canal "APRS".
+    void tncReconcile() {
+        bool onAprs = handler_.activeChannelName() == String(TNC_CHANNEL_NAME);
+        if (onAprs != dataChanActive_) {
+            dataChanActive_ = onAprs;
+            Serial.printf("[TNC] canal \"%s\" %s\n", TNC_CHANNEL_NAME,
+                          onAprs ? "actif" : "quitte");
+        }
+        bool want = dataChanActive_ && (cmdHandle_ != 0);
+        if (want && !tncRunning_) {
+            tncStart();
+        } else if (!want && tncRunning_) {
+            audio_.setDataMode(false);
+            vTaskDelay(pdMS_TO_TICKS(20));
+            tncStop();
+        }
+        audio_.setDataMode(tncRunning_);
     }
 
     // HT_SEND_DATA : [flags][ax25 fragment][chanId?]. On réassemble puis on
@@ -792,21 +839,24 @@ private:
 
     static void tncTxTrampoline(void* self) { static_cast<DualRfcommServers*>(self)->tncTxLoop(); }
     void tncTxLoop() {
-        uint8_t frame[512];
-        for (;;) {
+        uint8_t frame[330];
+        while (tncRunning_) {
             uint16_t n = 0;
-            if (xStreamBufferReceive(tncTxQ_, &n, sizeof(n), portMAX_DELAY) != sizeof(n)) continue;
+            if (xStreamBufferReceive(tncTxQ_, &n, sizeof(n), pdMS_TO_TICKS(150)) != sizeof(n)) continue;
             if (n == 0 || n > sizeof(frame)) continue;
             size_t got = 0;
-            while (got < n) {
-                got += xStreamBufferReceive(tncTxQ_, frame + got, n - got, pdMS_TO_TICKS(500));
+            while (got < n && tncRunning_) {
+                got += xStreamBufferReceive(tncTxQ_, frame + got, n - got, pdMS_TO_TICKS(200));
             }
+            if (!tncRunning_) break;
             Serial.printf("[TNC] TX trame AX.25 %u octets -> AFSK\n", n);
             handler_.setAudioTx(true);
             tnc_.txAx25(frame, n);           // modulate() bloque = temps réel
             vTaskDelay(pdMS_TO_TICKS(120));  // laisse la traîne DAC/PTT finir
             handler_.setAudioTx(false);
         }
+        tncTxTask_ = nullptr;
+        vTaskDelete(nullptr);
     }
 
     // Trame AX.25 reçue (FCS déjà vérifié/retiré) -> RX_DATA vers HTCommander,

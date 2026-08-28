@@ -1,4 +1,5 @@
 #include "TncModem.h"
+#include <new>
 
 #if TNC_ENABLE
 
@@ -6,11 +7,17 @@ TncModem* TncModem::self_ = nullptr;
 
 bool TncModem::begin() {
     self_ = this;
-    // Démod : rate = AFSK_SAMPLE_RATE (32000), décimation par 4 -> 8 kHz interne.
-    demod_ = new AfskDemodulator(AFSK_SAMPLE_RATE, 4, &TncModem::demodTrampoline);
-    // Mod : préambule ~250 ms de flags, 3 flags de fin.
-    mod_ = new AfskModulator(AFSK_SAMPLE_RATE, &TncModem::modTrampoline);
+    if (!demod_) demod_ = new (std::nothrow)
+        AfskDemodulator(AFSK_SAMPLE_RATE, 4, &TncModem::demodTrampoline);
+    if (!mod_)   mod_   = new (std::nothrow)
+        AfskModulator(AFSK_SAMPLE_RATE, &TncModem::modTrampoline);
     return demod_ && mod_;
+}
+
+void TncModem::end() {
+    txBusy_ = false;
+    if (demod_) { delete demod_; demod_ = nullptr; }
+    if (mod_)   { delete mod_;   mod_   = nullptr; }
 }
 
 void TncModem::demodTrampoline(const uint8_t* frame, size_t len) {
