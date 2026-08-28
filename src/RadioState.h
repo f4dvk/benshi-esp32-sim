@@ -132,6 +132,39 @@ public:
         return (id < CHANNEL_COUNT) ? id : 0;
     }
 
+    // Parametres RF decodes du canal actif (pour piloter un module SA818).
+    struct ActiveRf {
+        double  tx_mhz = 0, rx_mhz = 0;   // MHz
+        double  tx_ctcss_hz = 0, rx_ctcss_hz = 0;
+        bool    wide = true;              // bandwidth : 1 = 25 kHz, 0 = 12,5 kHz
+        bool    tx_at_max_power = true;   // puissance haute demandee
+        bool    emph_bypass = false;      // 1 = pas de pre/de-emphase
+        bool    tx_disable = false;
+    };
+    ActiveRf activeRf() const { return decodeRf(chan_[activeChannelId()]); }
+
+    static ActiveRf decodeRf(const std::vector<uint8_t>& s) {
+        ActiveRf r;
+        if (s.size() < CH_STRUCT_LEN) return r;
+        BitReader br(s.data(), s.size());
+        br.readBits(8);                              // channel_id
+        br.readBits(2);                              // tx_mod
+        r.tx_mhz = br.readBits(30) / 1e6;
+        br.readBits(2);                              // rx_mod
+        r.rx_mhz = br.readBits(30) / 1e6;
+        r.tx_ctcss_hz = br.readBits(16) / 100.0;
+        r.rx_ctcss_hz = br.readBits(16) / 100.0;
+        br.readBits(1);                              // scan
+        r.tx_at_max_power = br.readBits(1) != 0;     // tx_at_max_power
+        br.readBits(1);                              // talk_around
+        r.wide = br.readBits(1) != 0;                // bandwidth (1 = wide)
+        r.emph_bypass = br.readBits(1) != 0;         // pre_de_emph_bypass
+        br.readBits(1);                              // sign
+        br.readBits(1);                              // tx_at_med_power
+        r.tx_disable = br.readBits(1) != 0;          // tx_disable
+        return r;
+    }
+
     // ---- Region ----------------------------------------------------------
     uint8_t region() const { return region_; }
     void setRegion(uint8_t r) {

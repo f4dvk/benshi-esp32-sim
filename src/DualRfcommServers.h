@@ -6,6 +6,7 @@
 #include <esp_bt_device.h>
 #include <esp_gap_bt_api.h>
 #include <vector>
+#include <deque>
 #include "config.h"
 #include "GaiaFrame.h"
 #include "BenshiCommandHandler.h"
@@ -45,8 +46,13 @@
 
 class DualRfcommServers {
 public:
-    bool begin() {
+    // rf != nullptr && rf->present() -> mode SA818 (module RF réel piloté).
+    bool begin(Sa818* rf = nullptr) {
         instance_ = this;
+        handler_.setRfModule(rf);
+        rf_ = rf;
+        if (!audioMtx_) audioMtx_ = xSemaphoreCreateMutex();
+        audioCoalesce_.reserve(kAudioChunkBytes + 128);
 
         // 0) Etat runtime de la radio (canaux / reglages / region), charge
         //    depuis la NVS ou, a defaut, depuis config.h.
@@ -150,34 +156,129 @@ public:
         if (!audio_.begin()) {
             Serial.println("[SPP-DUAL] AVERTISSEMENT: pont audio non demarre (commandes OK).");
         }
+
+        // 7) Mode SA818 : cale le module sur le canal actif au demarrage.
+        if (rf_ && rf_->present()) {
+#if (RF_MODULE_HL_GPIO >= 0)
+            pinMode(RF_MODULE_HL_GPIO, OUTPUT);
+            digitalWrite(RF_MODULE_HL_GPIO, LOW);   // puissance haute par defaut
+#endif
+            rf_->setVolume(RF_MODULE_VOLUME);
+            handler_.syncRf();                      // fait aussi tune + filtres + puissance
+        }
         return true;
     }
 
     void sendAudioData(const uint8_t* sbcPayload, size_t len) {
-        if (audioHandle_ == 0) return;
-        std::vector<uint8_t> frame;
-        frame.push_back(0x00);               // Type = AudioData
-        frame.insert(frame.end(), sbcPayload, sbcPayload + len);
-        writeFramedAudio(frame);
+        std::vector<uint8_t> f;
+        f.reserve(len + 1);
+        f.push_back(0x00);                   // Type = AudioData
+        f.insert(f.end(), sbcPayload, sbcPayload + len);
+        enqueueAudio(std::move(f));
     }
 
-    void sendAudioEnd() {
-        if (audioHandle_ == 0) return;
-        std::vector<uint8_t> frame = { 0x01 };   // Type = AudioEnd
-        writeFramedAudio(frame);
+    void sendAudioEnd() { enqueueAudio(std::vector<uint8_t>{ 0x01 }); }  // Type = AudioEnd
+
+    // A appeler regulierement depuis loop() : retune differe du module RF +
+    // traces de mise au point de la chaine audio.
+    void poll() {
+        handler_.pollRf();
+        flushAudioCoalesce();
+
+        // Filet de securite : HTCommander a ouvert un 2e canal RFCOMM mais
+        // n'y a encore rien envoye -> aucun mapping. Le canal COMMANDE est deja
+        // identifie -> ce 2e canal ne peut etre que l'AUDIO.
+        if (audioHandle_ == 0 && cmdHandle_ != 0 && pendingConn_ != 0 &&
+            pendingConn_ != cmdHandle_ && millis() - pendingSinceMs_ > 700) {
+            Serial.printf("[SPP-DUAL] mapping AUDIO force (handle=%lu, aucune donnee recue)\n",
+                          (unsigned long)pendingConn_);
+            assignRole(pendingConn_, ROLE_AUDIO);
+            pendingConn_ = 0;
+            pendingListen_ = 0;
+        }
+
+#if AUDIO_DEBUG
+        uint32_t now = millis();
+        if (now - dbgLastMs_ >= 1000) {
+            dbgLastMs_ = now;
+            uint32_t enc = audio_.encFramesTake();
+            uint32_t sps = audio_.adcSamplesTake();
+            Serial.printf(
+                "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz | "
+                "RX<-HTC: cmd=%u audioData=%uf/%uo types=0x%03X | "
+                "mic: enc=%u SBC/s -> spp chunks sent=%u drop~=%u qlen=%u | "
+                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu\n",
+                (unsigned long)cmdHandle_, (unsigned long)audioHandle_,
+                (unsigned long)pendingConn_, (int)audioCong_,
+                audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps,
+                dbgCmdFrames_, dbgAudioFrames_, dbgAudioBytes_, dbgAudioTypes_,
+                enc, dbgAudioSent_, dbgAudioDrop_, (unsigned)audioTxQ_.size(),
+                (int)audio_.txToRadio(), (int)audio_.squelchRaw(),
+                (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel());
+            dbgCmdFrames_ = dbgAudioFrames_ = dbgAudioBytes_ = 0;
+            dbgAudioSent_ = dbgAudioDrop_ = 0;
+        }
+#endif
     }
 
 private:
-    static void setClassOfDevice(uint32_t cod) {
-        esp_bt_cod_t c;
-        c.minor = (cod >> 2) & 0x3F;
-        c.major = (cod >> 8) & 0x1F;
-        c.service = (cod >> 13) & 0x7FF;
-        esp_bt_gap_set_cod(c, ESP_BT_SET_COD_ALL);
+    // ~248 trames SBC/s de ~92 o : envoyees une par une, ca sature RFCOMM
+    // (overhead par paquet). On regroupe donc plusieurs trames par
+    // esp_spp_write (HTCommander re-decoupe sur les 0x7E). ~10 chunks en file.
+    static const size_t kAudioChunkBytes = 512;
+    static const size_t kAudioTxQMax     = 10;
+
+    void enqueueAudio(std::vector<uint8_t> payload) {
+#if AUDIO_DEBUG
+        if (!dbgTxDumped_ && payload.size() > 4 && payload[0] == 0x00) {
+            dbgTxDumped_ = true;
+            Serial.printf("[AUDIO-TX] 1re trame SBC (%u o) : %02X %02X %02X %02X %02X %02X ...\n",
+                          (unsigned)(payload.size() - 1), payload[1], payload[2],
+                          payload[3], payload[4], payload[5], payload[6]);
+            Serial.println("           (doit commencer par 9C = syncword SBC)");
+        }
+#endif
+        if (audioHandle_ == 0) {
+            dbgAudioDrop_++;
+#if AUDIO_DEBUG
+            uint32_t now = millis();
+            if (now - dbgNoAudioChanMs_ > 2000) {
+                dbgNoAudioChanMs_ = now;
+                Serial.println("[AUDIO-TX] !! audio a envoyer mais AUCUN canal audio RFCOMM "
+                               "(audioHandle_=0) -> HTCommander n'a pas ouvert le 2e canal");
+            }
+#endif
+            return;
+        }
+        bool isEnd = (!payload.empty() && payload[0] == 0x01);
+        lockAudio();
+        appendFramed(audioCoalesce_, payload);
+        audioCoalesceMs_ = millis();
+        if (audioCoalesce_.size() >= kAudioChunkBytes || isEnd) flushCoalesceLocked();
+        unlockAudio();
+        pumpAudioTx();
     }
 
-    void writeFramedAudio(const std::vector<uint8_t>& payload) {
-        std::vector<uint8_t> out;
+    // A appeler regulierement (poll) : evite qu'un petit reliquat traine.
+    void flushAudioCoalesce() {
+        lockAudio();
+        if (!audioCoalesce_.empty() && millis() - audioCoalesceMs_ > 12) flushCoalesceLocked();
+        unlockAudio();
+        pumpAudioTx();
+    }
+
+    void flushCoalesceLocked() {                 // audioMtx_ deja pris
+        if (audioCoalesce_.empty()) return;
+        if (audioTxQ_.size() >= kAudioTxQMax) { audioTxQ_.pop_front(); dbgAudioDrop_ += 6; }
+        audioTxQ_.push_back(std::move(audioCoalesce_));
+        audioCoalesce_ = std::vector<uint8_t>();
+        audioCoalesce_.reserve(kAudioChunkBytes + 128);
+    }
+
+    void lockAudio()   { if (audioMtx_) xSemaphoreTake(audioMtx_, portMAX_DELAY); }
+    void unlockAudio() { if (audioMtx_) xSemaphoreGive(audioMtx_); }
+
+    static void appendFramed(std::vector<uint8_t>& out, const std::vector<uint8_t>& payload) {
         out.push_back(0x7E);
         for (uint8_t b : payload) {
             if (b == 0x7E) { out.push_back(0x7D); out.push_back(0x5E); }
@@ -185,7 +286,37 @@ private:
             else out.push_back(b);
         }
         out.push_back(0x7E);
-        esp_spp_write(audioHandle_, out.size(), out.data());
+    }
+
+    // esp_spp_write en mode CB : une seule ecriture "en vol", suite au
+    // prochain ESP_SPP_WRITE_EVT (+ respect de la congestion).
+    void pumpAudioTx() {
+        std::vector<uint8_t> f;
+        lockAudio();
+        if (audioWriteInFlight_ || audioCong_ || audioTxQ_.empty() || audioHandle_ == 0) {
+            unlockAudio();
+            return;
+        }
+        f = std::move(audioTxQ_.front());
+        audioTxQ_.pop_front();
+        audioWriteInFlight_ = true;
+        unlockAudio();
+
+        if (esp_spp_write(audioHandle_, f.size(), f.data()) != ESP_OK) {
+            lockAudio();
+            audioWriteInFlight_ = false;
+            unlockAudio();
+            dbgAudioDrop_++;
+        } else {
+            dbgAudioSent_++;
+        }
+    }
+    static void setClassOfDevice(uint32_t cod) {
+        esp_bt_cod_t c;
+        c.minor = (cod >> 2) & 0x3F;
+        c.major = (cod >> 8) & 0x1F;
+        c.service = (cod >> 13) & 0x7FF;
+        esp_bt_gap_set_cod(c, ESP_BT_SET_COD_ALL);
     }
 
     void sendCommandReply(const BenshiMessage& msg) {
@@ -299,8 +430,11 @@ private:
                 }
                 const uint8_t* a = param->srv_open.rem_bda;
                 Serial.printf("[SPP-DUAL] Connexion entrante de %02X:%02X:%02X:%02X:%02X:%02X"
-                              " (handle=%lu)\n", a[0], a[1], a[2], a[3], a[4], a[5],
-                              (unsigned long)param->srv_open.handle);
+                              " (handle=%lu, new_listen=%lu, cmd=%lu audio=%lu)\n",
+                              a[0], a[1], a[2], a[3], a[4], a[5],
+                              (unsigned long)param->srv_open.handle,
+                              (unsigned long)param->srv_open.new_listen_handle,
+                              (unsigned long)cmdHandle_, (unsigned long)audioHandle_);
 
                 // NE PAS comparer new_listen_handle aux handles memorises au
                 // START_EVT : new_listen_handle est un handle NEUF cree pour
@@ -310,6 +444,7 @@ private:
                 // handle, qui nous donnera le scn du serveur concerne.
                 pendingConn_ = param->srv_open.handle;
                 pendingListen_ = param->srv_open.new_listen_handle;
+                pendingSinceMs_ = millis();
                 break;
             }
 
@@ -317,6 +452,12 @@ private:
                 if (param->close.handle == cmdHandle_)   { cmdHandle_ = 0;   cmdRxBuf_.clear(); }
                 if (param->close.handle == audioHandle_) {
                     audioHandle_ = 0; audioRxFrame_.clear();
+                    lockAudio();
+                    audioTxQ_.clear();
+                    audioCoalesce_.clear();
+                    audioWriteInFlight_ = false;
+                    audioCong_ = false;
+                    unlockAudio();
                     handler_.setAudioConnected(false);
                     handler_.setAudioRx(false, 0);
                     handler_.setAudioTx(false);
@@ -339,12 +480,41 @@ private:
                     if (h == pendingConn_) { pendingConn_ = 0; pendingListen_ = 0; }
                 }
 
-                if (h == cmdHandle_)        handleCmdBytes(d, len);
-                else if (h == audioHandle_) handleAudioBytes(d, len);
-                else Serial.printf("[SPP-DUAL] %u octets sur un canal non identifie "
-                                   "(1er octet 0x%02X), ignores\n", len, len ? d[0] : 0);
+                if (h == cmdHandle_) {
+#if AUDIO_DEBUG
+                    if (len > 0 && d[0] == 0x7E)
+                        Serial.println("[SPP-DUAL] !! trame AUDIO (0x7E) recue sur le canal COMMANDE "
+                                       "-> mapping des canaux inverse ?");
+#endif
+                    handleCmdBytes(d, len);
+                } else if (h == audioHandle_) {
+                    handleAudioBytes(d, len);
+                } else {
+                    Serial.printf("[SPP-DUAL] %u octets sur un canal non identifie "
+                                  "(handle=%lu, 1er octet 0x%02X)\n",
+                                  len, (unsigned long)h, len ? d[0] : 0);
+                }
                 break;
             }
+
+            case ESP_SPP_WRITE_EVT:
+                if (param->write.handle == audioHandle_) {
+                    lockAudio();
+                    audioWriteInFlight_ = false;
+                    audioCong_ = param->write.cong;
+                    unlockAudio();
+                    pumpAudioTx();
+                }
+                break;
+
+            case ESP_SPP_CONG_EVT:
+                if (param->cong.handle == audioHandle_) {
+                    lockAudio();
+                    audioCong_ = param->cong.cong;
+                    unlockAudio();
+                    if (!param->cong.cong) pumpAudioTx();
+                }
+                break;
 
             default:
                 break;
@@ -366,11 +536,20 @@ private:
     void assignRole(uint32_t handle, Role role) {
         if (role == ROLE_CMD) {
             cmdHandle_ = handle;
-            Serial.println("[SPP-DUAL] -> canal COMMANDE");
+            Serial.printf("[SPP-DUAL] -> canal COMMANDE (handle=%lu, scn cmd=%u audio=%u)\n",
+                          (unsigned long)handle, cmdScn_, audioScn_);
         } else if (role == ROLE_AUDIO) {
             audioHandle_ = handle;
+            lockAudio();
+            audioWriteInFlight_ = false;
+            audioCong_ = false;
+            unlockAudio();
             handler_.setAudioConnected(true);
-            Serial.println("[SPP-DUAL] -> canal AUDIO");
+            Serial.printf("[SPP-DUAL] -> canal AUDIO (handle=%lu, scn cmd=%u audio=%u)\n",
+                          (unsigned long)handle, cmdScn_, audioScn_);
+        } else {
+            Serial.printf("[SPP-DUAL] -> canal INDETERMINE (handle=%lu) : ni cmd ni audio scn\n",
+                          (unsigned long)handle);
         }
     }
 
@@ -436,6 +615,9 @@ private:
 
             BenshiMessage in;
             if (decodeMessage(encodedMsg.data(), encodedMsg.size(), in)) {
+#if AUDIO_DEBUG
+                dbgCmdFrames_++;
+#endif
                 BenshiMessage out;
                 if (handler_.process(in, out)) {
                     sendCommandReply(out);
@@ -467,10 +649,17 @@ private:
         uint8_t type = frame[0];
         const uint8_t* payload = frame.data() + 1;
         size_t         plen    = frame.size() - 1;
+#if AUDIO_DEBUG
+        dbgAudioTypes_ |= (type < 16) ? (uint16_t)(1u << type) : 0x8000;
+#endif
         switch (type) {
             case 0x00:   // AudioData (numerotation "impaire" cote HTCommander)
             case 0x03:   // AudioData
                 audio_.pushRadioSbc(payload, plen);
+#if AUDIO_DEBUG
+                dbgAudioFrames_++;
+                dbgAudioBytes_ += plen;
+#endif
                 break;
             case 0x01:   // AudioEnd
                 audio_.radioAudioEnd();
@@ -495,7 +684,7 @@ private:
     static const uint8_t AUDIO_SCN = 2;
 
     uint32_t cmdHandle_ = 0, audioHandle_ = 0;
-    uint32_t pendingConn_ = 0, pendingListen_ = 0;
+    uint32_t pendingConn_ = 0, pendingListen_ = 0, pendingSinceMs_ = 0;
     uint32_t vendorSdpHandle_ = 0;
     uint8_t  cmdScn_ = 0, audioScn_ = 0;
     uint8_t  startedServers_ = 0;
@@ -504,6 +693,26 @@ private:
     bool audioEscapeNext_ = false;
     BenshiCommandHandler handler_;
     AudioBridge audio_;
+    Sa818* rf_ = nullptr;
+
+    // File d'emission audio (esp_spp_write CB : 1 seule ecriture en vol).
+    SemaphoreHandle_t audioMtx_ = nullptr;
+    std::deque<std::vector<uint8_t>> audioTxQ_;
+    std::vector<uint8_t> audioCoalesce_;
+    uint32_t audioCoalesceMs_ = 0;
+    bool audioWriteInFlight_ = false;
+    volatile bool audioCong_ = false;
+
+    // Compteurs de mise au point (remis a zero chaque seconde par poll()).
+    uint32_t dbgLastMs_     = 0;
+    uint32_t dbgCmdFrames_  = 0;
+    uint32_t dbgAudioFrames_ = 0;
+    uint32_t dbgAudioBytes_ = 0;
+    uint32_t dbgAudioSent_  = 0;
+    uint32_t dbgAudioDrop_  = 0;
+    uint32_t dbgNoAudioChanMs_ = 0;
+    uint16_t dbgAudioTypes_ = 0;
+    bool     dbgTxDumped_ = false;
 };
 
 inline DualRfcommServers* DualRfcommServers::instance_ = nullptr;

@@ -1,24 +1,46 @@
 # Simulateur de radio Benshi (VR-N76) sur ESP32 (pour HTCommander)
 
-> ⚠️ **PROJET EN COURS DE DÉVELOPPEMENT — première version, non finalisée.**
+> ⚠️ **PROJET EN COURS DE DÉVELOPPEMENT.**
 >
 > Ce qui fonctionne : détection par HTCommander, appairage, dialogue de
 > commande/contrôle (infos radio, réglages, statut), lecture **et édition**
 > des canaux mémoire avec persistance en mémoire flash (NVS), sélection du
 > VFO / canal actif, région.
 >
-> Audio : **implémenté mais non validé sur matériel.** Codec SBC 32 kHz
-> (encodeur + décodeur de `libbt.a`), framing du canal audio, pont vers le
-> **DAC / ADC internes**, **sortie PTT et entrée squelch** pour piloter un
-> poste réel (brochage aligné sur [kv4p-ht](https://github.com/VanceVagell/kv4p-ht)),
-> et notifications de statut (`HT_STATUS_CHANGED` : TX / squelch / S-mètre).
-> Il reste à régler à l'oreille le mode ADC+DAC interne simultané et à câbler
-> l'étage analogique (voir « Audio » plus bas). Développé sans matériel de test.
+> Audio + modes : **validé sur matériel** (carte kv4p-ht v1 + module SA818).
+> Réception ET émission audio (codec SBC 32 kHz de `libbt.a`), **sortie PTT /
+> entrée squelch**, **détection SA818 au boot** (mode module RF réel vs mode
+> passerelle poste externe — brochage
+> [kv4p-ht](https://github.com/VanceVagell/kv4p-ht)), pilotage du SA818
+> (fréquence, largeur, CTCSS, squelch, filtres, puissance), notifications de
+> statut (`HT_STATUS_CHANGED`). L'émission via le DAC 8 bits interne peut
+> présenter un peu de bruit de quantification (filtre `AUDIO_DAC_LOWPASS` en
+> option).
 >
 > Ce qui **ne fonctionne pas encore** : le mode VFO fréquence libre.
 >
 > Utilisez-le pour l'interopérabilité Bluetooth / le test de HTCommander,
 > pas comme une vraie radio. Retours et contributions bienvenus.
+
+## Deux modes de fonctionnement (choisis au démarrage)
+
+Au boot, l'ESP tente un handshake `AT+DMOCONNECT` sur l'UART RF
+(GPIO16/17). Selon le résultat :
+
+| | **Mode SA818** | **Mode UV-K1** (historique) |
+|---|---|---|
+| Condition | un module **SA818 / DRA818** répond (≤ `RF_MODULE_PROBES` essais, 3 par défaut) | aucun module détecté |
+| Rôle de l'ESP | **pilote un vrai module RF** : les canaux de `config.h` sont des fréquences réelles ; changer de canal / VFO dans HTCommander **retune** le module (`AT+DMOSETGROUP`) | **simule** entièrement la radio (fréquences, canaux, statut) et sert de **passerelle audio/PTT/squelch** vers un poste externe non pilotable |
+| Audio / PTT / squelch | vers le module SA818 | vers le poste externe (ex. Quansheng UV-K1) |
+| Interface HTCommander | **identique** (Bluetooth Classic, protocole Benshi) | **identique** |
+
+Le brochage suit celui de [kv4p-ht](https://github.com/VanceVagell/kv4p-ht)
+pour que la même carte serve aux deux usages (`RF_MODULE_ENABLE = false`
+force le mode UV-K1 sans sonder l'UART).
+
+> Le **mode SA818** est validé sur matériel. Le **mode UV-K1** partage la même
+> chaîne audio/PTT/squelch mais n'a pas encore été testé bout à bout avec un
+> poste externe.
 
 Ce projet PlatformIO fait passer un ESP32 pour une radio Benshi VR-N76, afin
 que [HTCommander](https://github.com/Ylianst/HTCommander) puisse s'y
@@ -87,10 +109,14 @@ plus compilé par défaut.
   chaque écriture, et pendant l'audio (`is_in_tx` à l'émission, `is_sq` /
   `is_in_rx` + RSSI en réception). Byte-pour-byte identique à ce qu'émet une
   vraie VR-N76. Respecte `REGISTER_NOTIFICATION`.
-- **Interface poste réel** (`AudioBridge.h` + `SbcCodec.h`) : canal RFCOMM audio
-  ↔ DAC / ADC internes + **sortie PTT** et **entrée squelch** pour piloter un
-  émetteur-récepteur externe (ex. Quansheng UV-K1). Codec SBC réutilisé depuis
-  `libbt.a`. Brochage kv4p-ht. Voir [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
+- **Interface radio** (`AudioBridge.h` + `SbcCodec.h`) : canal RFCOMM audio ↔
+  DAC / ADC internes + **sortie PTT** et **entrée squelch**. Codec SBC réutilisé
+  depuis `libbt.a`. Brochage kv4p-ht. Voir [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
+- **Détection de mode au boot** (`Sa818.h`, `main.cpp`) : handshake `AT+DMOCONNECT`
+  sur l'UART RF → **mode SA818** (pilotage d'un module RF réel : retune sur
+  changement de canal / VFO via `AT+DMOSETGROUP`, volume, filtres) ou **mode
+  UV-K1** (simulation + passerelle vers poste externe). Pilote SA818/DRA818
+  autonome, sans dépendance ajoutée.
 
 ## Détection par HTCommander — d'après son code source
 
@@ -194,34 +220,44 @@ Les broches reprennent celles du firmware kv4p-ht pour ESP32 WROOM-32
 (`kv4p_ht_esp32_wroom_32/globals.h`), pour qu'une même carte / un même
 adaptateur serve aux deux projets.
 
+« Cible » = le module SA818 en **mode SA818**, ou le poste externe en **mode UV-K1**.
+
 | Fonction | GPIO | kv4p-ht | Détail |
 |---|---|---|---|
-| **Audio → poste** (DAC) | **25** (+26) | `PIN_AUDIO_OUT` | Sortie du DAC interne vers l'**entrée micro** du poste. 0–3,3 V / 8 bits → prévoir un **atténuateur** vers le niveau micro. L'I2S pilote GPIO25 *et* GPIO26 ; utiliser GPIO25. |
-| **Audio ← poste** (ADC) | **34** (`ADC1_CH6`) | `PIN_AUDIO_IN` | Entrée ADC1 depuis la **sortie HP** du poste. `AUDIO_ADC_CHANNEL` dans `config.h` (ADC1 uniquement — ADC2 en conflit radio). |
-| **PTT → poste** (sortie) | **18** | `PIN_PTT` | Keye l'émission du poste dès que HTCommander envoie de l'audio ; relâché après `AUDIO_PTT_TAIL_MS`. **Actif à l'état bas** (comme kv4p-ht). |
-| **Squelch ← poste** (entrée) | **32** | `PIN_SQ` | Signale que le poste reçoit → démarre la capture ADC vers HTCommander et renseigne `is_sq` / `is_in_rx` / RSSI. `-1` ⇒ détection **VOX** sur le signal ADC. Actif à l'état bas par défaut. |
+| **Audio → cible** (DAC) | **25** (+26) | `PIN_AUDIO_OUT` | Sortie du DAC interne vers l'**entrée micro** de la cible. 0–3,3 V / 8 bits → prévoir un **atténuateur**. L'I2S pilote GPIO25 *et* GPIO26 ; utiliser GPIO25. |
+| **Audio ← cible** (ADC) | **34** (`ADC1_CH6`) | `PIN_AUDIO_IN` | Entrée ADC1 depuis la **sortie HP** de la cible. `AUDIO_ADC_CHANNEL` dans `config.h` (ADC1 uniquement — ADC2 en conflit radio). |
+| **PTT → cible** (sortie) | **18** | `PIN_PTT` | Keye l'émission dès que HTCommander envoie de l'audio ; relâché après `AUDIO_PTT_TAIL_MS`. **Actif à l'état bas** (comme kv4p-ht). |
+| **Squelch ← cible** (entrée) | **32** | `PIN_SQ` | Signale une réception → démarre la capture ADC vers HTCommander, renseigne `is_sq` / `is_in_rx` / RSSI. `-1` ⇒ **VOX** sur le signal ADC. Actif à l'état bas par défaut. |
+| **UART module RF** | **16 / 17** | `PIN_RF_RXD` / `PIN_RF_TXD` | `Serial2` @ 9600. Sondé au boot ; si un SA818/DRA818 répond → **mode SA818**. Libre en mode UV-K1. |
+| **PD module RF** | **19** | `PIN_PD` | Alimentation du module SA818 (HIGH = allumé). `-1` si non câblé. Inutile en mode UV-K1. |
 | PTT local (option) | `-1` | `PIN_PHYS_PTT1/2` (5 / 33) | Force la capture ADC → HTCommander comme si le squelch était ouvert. |
 | LED d'état (option) | `-1` | `PIN_LED` (2) | Fixe en émission, clignote en réception. |
 
-Tout se règle dans la **section 5 de [`src/config.h`](src/config.h)**
-(`AUDIO_PTT_GPIO`, `AUDIO_PTT_ACTIVE_LOW`, `AUDIO_PTT_TAIL_MS`, `AUDIO_SQ_GPIO`,
-`AUDIO_SQ_ACTIVE_LOW`, `AUDIO_SQ_VOX_THRESH`, `AUDIO_ADC_CHANNEL`,
-`AUDIO_SPK_VOLUME`, `AUDIO_MIC_GAIN`, `AUDIO_SBC_BITPOOL`…). `AUDIO_BRIDGE_ENABLE`
-à `false` compile un firmware « commandes seules » (aucun accès I2S / DAC / ADC /
-GPIO audio).
+Réglages : **section 5** de [`src/config.h`](src/config.h) (audio : `AUDIO_PTT_*`,
+`AUDIO_SQ_*`, `AUDIO_ADC_CHANNEL`, `AUDIO_SPK_VOLUME`, `AUDIO_MIC_GAIN`,
+`AUDIO_SBC_BITPOOL`, `AUDIO_BRIDGE_ENABLE`…) et **section 6** (module RF :
+`RF_MODULE_ENABLE`, `RF_MODULE_UART_RX/TX`, `RF_MODULE_PD_GPIO`,
+`RF_MODULE_PROBES`, `RF_MODULE_VOLUME`, `RF_MODULE_SQUELCH`).
 
-> `PIN_PD` (GPIO19) et l'UART RF (16/17) de kv4p-ht pilotent son module radio
-> **interne** (SA818) : sans objet ici puisque le poste est externe. Ces broches
-> restent libres.
+> Sur ESP32-**WROVER**, GPIO16/17 sont pris par la PSRAM : câbler l'UART RF
+> ailleurs (ou utiliser un WROOM-32 / DevKitC).
 
-### À valider sur matériel
+### Notes matériel
 
-Le mode ADC + DAC internes **simultané** de l'ESP32 (un seul I2S0) est
-notoirement bruyant et sensible au format d'échantillon ; l'étage analogique
-(atténuateur DAC → micro, adaptation HP → ADC, prise du signal squelch) est à
-faire côté matériel. La chaîne SBC + framing + files d'attente + logique
-PTT/squelch est en revanche indépendante du matériel. Détails et pistes de
-réglage : [`docs/AudioProtocol.md`](docs/AudioProtocol.md).
+- L'ADC et le DAC internes de l'ESP32 partagent l'unique I2S0 : le pont bascule
+  I2S0 entre entrée ADC (réception) et sortie DAC (émission) à chaque PTT —
+  **half-duplex**, comme une vraie radio.
+- GPIO34 est une **entrée seule** (pas de pull interne) : la polarisation
+  externe est obligatoire (GPIO26 → résistance → GPIO34, audio couplé par
+  condensateur). Câblage kv4p-ht.
+- L'émission utilise le **DAC 8 bits** interne (≈ 48 dB de plancher de bruit) :
+  un peu de bruit de quantification est normal. Options : `AUDIO_DAC_LOWPASS`
+  (filtre logiciel), ou soigner le filtre RC de la carte.
+- En émission réelle, le SA818 tire des pics de courant : **l'alimenter
+  séparément** (masse commune), sinon l'ESP peut redémarrer.
+
+Détails du protocole et de l'implémentation :
+[`docs/AudioProtocol.md`](docs/AudioProtocol.md).
 
 ## MAC Bluetooth
 

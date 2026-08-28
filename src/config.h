@@ -190,6 +190,12 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //     le niveau micro du poste (quelques mV à quelques dizaines de mV).
 #define AUDIO_DAC_ENABLE       true
 #define AUDIO_SPK_VOLUME       0.80f    // 0..1, atténuation numérique avant le DAC
+// Filtre passe-bas 1 pôle sur la sortie DAC : adoucit l'escalier 8 bits et le
+// souffle de quantification. alpha = 1 - exp(-2*pi*fc/32000). 0.55 ≈ 4 kHz.
+// À laisser false si le câblage kv4p-ht filtre déjà assez ; true si "bruits
+// numériques" en émission.
+#define AUDIO_DAC_LOWPASS      false
+#define AUDIO_DAC_LP_ALPHA     0.55f
 
 // --- Entrée audio depuis le poste : ADC1 interne, lu par le même I2S en mode
 //     "built-in ADC" (DMA). ADC1 uniquement (ADC2 entre en conflit radio).
@@ -200,6 +206,21 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define AUDIO_ADC_CHANNEL      6        // GPIO34 (ADC1_CH6) — comme kv4p-ht
 #define AUDIO_MIC_GAIN         8.0f     // gain numérique appliqué au PCM capté
 #define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais)
+// Polarisation de l'entrée ADC : l'ESP injecte VDD/2 sur GPIO26 (DAC2) pour
+// centrer le signal audio de la cible (couplé en alternatif via un condo),
+// exactement comme kv4p-ht. Actif uniquement hors émission.
+#define AUDIO_ADC_BIAS_ENABLE  true
+#define AUDIO_ADC_BIAS_CODE    128      // 0..255 (128 ≈ 1,65 V)
+
+// IMPORTANT : sur l'ESP32, l'ADC interne et le DAC interne partagent l'unique
+// I2S0 et NE peuvent PAS fonctionner en même temps. Le pont bascule donc I2S0
+// entre "entrée ADC" (réception) et "sortie DAC" (émission) à chaque
+// changement de PTT — comme kv4p-ht. Half-duplex, comme une vraie radio.
+//
+// Horloge I2S : APLL = clock plus précise. kv4p-ht l'active ; certains
+// rapportent que l'APLL ne marche pas avec le DAC intégré -> false par défaut,
+// à essayer à true si le son est déformé / faux en fréquence.
+#define AUDIO_I2S_APLL         false
 
 // --- PTT : SORTIE qui keye l'émission du poste quand HTCommander émet
 //     (dès que des trames AudioData arrivent ; relâché après AUDIO_PTT_TAIL_MS
@@ -212,9 +233,10 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // --- Squelch : ENTRÉE indiquant que le poste reçoit un signal (squelch
 //     ouvert). Sert à démarrer la capture ADC -> HTCommander et à renseigner
 //     is_sq / is_in_rx (+ RSSI) dans HT_STATUS_CHANGED.
-//     kv4p-ht : PIN_SQ = 32.  -1 = pas de fil squelch -> détection au niveau
-//     du signal ADC (VOX) avec le seuil AUDIO_SQ_VOX_THRESH.
-#define AUDIO_SQ_GPIO          32       // -1 = VOX audio
+//     kv4p-ht : PIN_SQ = 32 sur les cartes v1 ; = 4 sur les v2.0c / v2.0d !
+//     -1 = pas de fil squelch -> détection au niveau du signal ADC (VOX,
+//     seuil AUDIO_SQ_VOX_THRESH). Utile pour isoler un souci de squelch.
+#define AUDIO_SQ_GPIO          32       // v1 = 32, v2.0c/d = 4, -1 = VOX audio
 #define AUDIO_SQ_ACTIVE_LOW    true     // LOW = squelch ouvert (signal présent)
 #define AUDIO_SQ_PULLUP        true
 #define AUDIO_SQ_VOX_THRESH    600      // |PCM| moyen déclenchant la VOX (si SQ=-1)
@@ -226,3 +248,53 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // --- LED d'état (optionnel) : allumée pendant TX vers le poste, clignote en
 //     RX depuis le poste. kv4p-ht : 2 (LED interne).
 #define AUDIO_STATUS_LED_GPIO  -1       // ex. 2
+
+// ----------------------------------------------------------------------
+// 6) Mode de fonctionnement : module RF SA818 vs poste externe "UV-K1"
+// ----------------------------------------------------------------------
+// Au démarrage l'ESP tente un handshake AT+DMOCONNECT sur l'UART RF :
+//
+//   * module SA818 / DRA818 détecté  -> MODE "SA818" : l'ESP pilote un VRAI
+//     module radio. Les canaux de la section 4 deviennent des fréquences
+//     RÉELLES ; tout changement de canal / VFO côté HTCommander retune le
+//     module (AT+DMOSETGROUP). PTT (GPIO18) et squelch (GPIO32) pilotent /
+//     lisent le module. C'est l'usage "façon kv4p-ht".
+//
+//   * aucun module détecté (après RF_MODULE_PROBES essais) -> MODE "UV-K1" :
+//     comportement historique = simulation complète (fréquences, canaux,
+//     statut) + passerelle audio/PTT/squelch vers un poste externe NON
+//     pilotable (Quansheng UV-K1 ou autre).
+//
+// Dans les deux cas, l'interface vue par HTCommander (Bluetooth Classic,
+// protocole Benshi) est IDENTIQUE.
+//
+// Brochage UART RF aligné sur kv4p-ht (PIN_RF_RXD 16 / PIN_RF_TXD 17 / PIN_PD 19).
+#define RF_MODULE_ENABLE      true      // false -> toujours mode UV-K1 (pas de sonde UART)
+#define RF_MODULE_UART_RX     16        // ESP RX  <- TX du module
+#define RF_MODULE_UART_TX     17        // ESP TX  -> RX du module
+#define RF_MODULE_PD_GPIO     19        // PD : HIGH = module alimenté (-1 = non câblé)
+#define RF_MODULE_PROBES      3         // nb de handshakes AT+DMOCONNECT avant abandon
+#define RF_MODULE_VOLUME      6         // volume HP du module, 1..8
+#define RF_MODULE_SQUELCH     1         // squelch matériel du module, 0..8 (0 = ouvert)
+#define RF_MODULE_WIDE        true      // true = 25 kHz, false = 12,5 kHz (si le canal ne le fixe pas)
+// Broche H/L de puissance du module (kv4p-ht PIN_HL : v2.0c = 23, sinon -1).
+// LOW = puissance haute, HIGH = puissance basse. Pilotée par le bit
+// tx_at_max_power du canal.
+#define RF_MODULE_HL_GPIO     -1
+
+// Ce que le mode SA818 pilote sur le module, à chaque changement de canal :
+//   - fréquences TX / RX                     (AT+DMOSETGROUP)   -> depuis le canal
+//   - bande passante 12,5 / 25 kHz           (AT+DMOSETGROUP)   -> depuis le canal
+//   - CTCSS TX / RX                          (AT+DMOSETGROUP)   -> depuis le canal
+//   - squelch matériel 0..8                  (AT+DMOSETGROUP)   -> RF_MODULE_SQUELCH
+//   - filtres pré/de-emphase + HP + BP       (AT+SETFILTER)     -> bit pre_de_emph_bypass du canal
+//   - volume HP                              (AT+DMOSETVOLUME)  -> RF_MODULE_VOLUME (au boot)
+//   - puissance haute / basse                (broche H/L)       -> bit tx_at_max_power (si RF_MODULE_HL_GPIO)
+
+// ----------------------------------------------------------------------
+// 7) Traces de mise au point
+// ----------------------------------------------------------------------
+// true -> le firmware imprime périodiquement (1 s) l'état du pont audio :
+// canaux RFCOMM, débit audio TX/RX, pertes de congestion, PTT, squelch.
+// Indispensable tant que l'audio n'est pas validé sur matériel.
+#define AUDIO_DEBUG           true

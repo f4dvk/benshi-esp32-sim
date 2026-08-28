@@ -3,6 +3,7 @@
 #include <atomic>
 #include "BenshiProtocol.h"
 #include "RadioState.h"
+#include "Sa818.h"
 #include "config.h"
 
 // ============================================================================
@@ -30,6 +31,44 @@ public:
 
     void begin() { state_.begin(); }
     void onNotify(NotifSink sink) { sink_ = std::move(sink); }
+
+    // Mode SA818 : module RF réel à piloter (nullptr = mode "UV-K1" simulé).
+    void setRfModule(Sa818* rf) { rf_ = rf; }
+
+    // Retune le module RF sur le canal actif (I/O UART bloquante ~ms).
+    // À appeler depuis un contexte non critique (boucle Arduino), pas depuis
+    // le callback Bluetooth.
+    void syncRf() {
+        if (!rf_ || !rf_->present()) return;
+        RadioState::ActiveRf rf = state_.activeRf();
+        if (rf.tx_mhz < 1.0 || rf.rx_mhz < 1.0) {
+            Serial.printf("[SA818] Canal actif %u : frequences invalides (tx=%.4f rx=%.4f) -> pas de retune\n",
+                          state_.activeChannelId(), rf.tx_mhz, rf.rx_mhz);
+            return;
+        }
+        bool ok = rf_->tune(rf.rx_mhz, rf.tx_mhz, rf.rx_ctcss_hz, rf.tx_ctcss_hz,
+                            rf.wide, RF_MODULE_SQUELCH);
+        // Filtres : pre/de-emphase + passe-haut + passe-bas suivent le bit
+        // pre_de_emph_bypass du canal (bypass -> tout coupe).
+        bool filt = !rf.emph_bypass;
+        rf_->setFilters(filt, filt, filt);
+        // Puissance : broche H/L du module (LOW = haute puissance, kv4p-ht).
+#if (RF_MODULE_HL_GPIO >= 0)
+        digitalWrite(RF_MODULE_HL_GPIO, rf.tx_at_max_power ? LOW : HIGH);
+#endif
+        Serial.printf("[SA818] Retune canal %u : RX %.4f / TX %.4f MHz, %s, CTCSS %.1f/%.1f, "
+                      "emphase %s, puissance %s -> %s\n",
+                      state_.activeChannelId(), rf.rx_mhz, rf.tx_mhz,
+                      rf.wide ? "25kHz" : "12.5kHz", rf.rx_ctcss_hz, rf.tx_ctcss_hz,
+                      rf.emph_bypass ? "OFF" : "ON",
+                      rf.tx_at_max_power ? "HAUTE" : "basse",
+                      ok ? "OK" : "ECHEC (module hors bande ? pas de reponse ?)");
+    }
+
+    // Appelé périodiquement par le transport (boucle Arduino).
+    void pollRf() {
+        if (rfDirty_.exchange(false)) syncRf();
+    }
 
     // Traite un message entrant et renvoie true si une réponse doit être
     // envoyée (outMsg rempli).
@@ -68,7 +107,7 @@ public:
             bool ok = state_.setSettingsStruct(in.body.data(), in.body.size());
             outMsg.body = BenshiReplies::writeSettingsAck(
                 ok ? ReplyStatus::SUCCESS : ReplyStatus::INVALID_PARAMETER);
-            if (ok) htStatusDirty_ = true;
+            if (ok) { htStatusDirty_ = true; rfDirty_.store(true); }   // VFO/canal -> retune
 
         } else if (in.command == READ_RF_CH) {
             uint8_t channelId = in.body.empty() ? 0 : in.body[0];
@@ -80,7 +119,10 @@ public:
             bool ok = state_.setChannelStruct(channelId, in.body.data(), in.body.size());
             outMsg.body = BenshiReplies::writeRfChAck(
                 ok ? ReplyStatus::SUCCESS : ReplyStatus::INVALID_PARAMETER, channelId);
-            if (ok) htStatusDirty_ = true;
+            if (ok) {
+                htStatusDirty_ = true;
+                if (channelId == state_.activeChannelId()) rfDirty_.store(true);  // canal actif édité -> retune
+            }
 
         } else if (in.command == SET_REGION) {
             uint8_t regionId = in.body.empty() ? 0 : in.body[0];
@@ -108,6 +150,16 @@ public:
         } else if (in.command == GET_HT_STATUS) {
             outMsg.body = BenshiReplies::htStatus(state_, inTx_.load(), sqOpen_.load(),
                                                   rssi_.load(), aocConnected_.load());
+
+        } else if (in.command == GET_VOLUME) {
+            outMsg.body = { ReplyStatus::SUCCESS, volume_ };
+
+        } else if (in.command == SET_VOLUME) {
+            if (!in.body.empty()) {
+                volume_ = in.body[0] & 0x0F;
+                if (rf_ && rf_->present()) rf_->setVolume(volume_ ? volume_ : 1);
+            }
+            outMsg.body = { ReplyStatus::SUCCESS };
 
         } else if (in.command == SET_PHONE_STATUS) {
             outMsg.body = BenshiReplies::phoneStatusAck();
@@ -165,12 +217,15 @@ public:
 private:
     RadioState state_;
     NotifSink  sink_;
+    Sa818*     rf_ = nullptr;
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré
     bool     htStatusDirty_  = false;
+    std::atomic<bool> rfDirty_{false};   // canal actif changé -> retune module RF
 
     std::atomic<bool>    sqOpen_{false};
     std::atomic<uint8_t> rssi_{0};
     std::atomic<bool>    aocConnected_{false};
     std::atomic<bool>    inTx_{false};
+    uint8_t              volume_ = RF_MODULE_VOLUME;
 };

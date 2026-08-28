@@ -28,6 +28,8 @@ namespace BasicCommand {
     static const uint16_t READ_RF_CH              = 13;
     static const uint16_t WRITE_RF_CH             = 14;
     static const uint16_t GET_HT_STATUS           = 20;
+    static const uint16_t GET_VOLUME              = 22;
+    static const uint16_t SET_VOLUME              = 23;
     static const uint16_t HT_SEND_DATA            = 31;
     static const uint16_t READ_BSS_SETTINGS       = 33;
     static const uint16_t WRITE_BSS_SETTINGS      = 34;

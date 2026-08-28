@@ -67,11 +67,39 @@ Conséquences :
     l'ADC1 (GPIO34) est capturé → encodage SBC → `sendAudioData()` ;
     `sendAudioEnd()` à la fermeture du squelch. `onRxLevel(actif, rssi)` →
     `is_sq` / `is_in_rx` / RSSI.
-  - Half-duplex logique : la capture ADC → HTCommander est inhibée pendant
-    l'émission vers le poste.
-  - Tâches FreeRTOS (core 1) : `audio_pump` (I2S temps réel), `audio_rx`
-    (décodage), `audio_tx` (encodage), `audio_ctl` (PTT / squelch / statut).
+  - **Half-duplex matériel** : sur l'ESP32, l'ADC et le DAC internes partagent
+    l'unique I2S0 et ne peuvent pas tourner en même temps. `audio_pump`
+    **réinstalle** le pilote I2S0 en entrée ADC (réception) ou en sortie DAC
+    (émission) à chaque bascule de PTT — comme kv4p-ht. Une vraie radio est de
+    toute façon half-duplex.
+  - **Polarisation ADC** : GPIO34 est *entrée seule* (pas de pull interne) →
+    l'ESP injecte VDD/2 sur GPIO26 (DAC2) et le montage doit relier GPIO26 →
+    (résistance) → GPIO34, avec l'audio de la cible couplé en alternatif
+    (condensateur) sur GPIO34. Câblage kv4p-ht.
+  - **Contrôle de flux SPP** : `esp_spp_write` en mode callback n'accepte
+    qu'une écriture à la fois → les trames audio sortantes sont mises en file
+    (`audioTxQ_`, ~100 ms) et écrites au fil des `ESP_SPP_WRITE_EVT` /
+    `ESP_SPP_CONG_EVT` ; débordement = on jette les plus vieilles.
+  - Tâches FreeRTOS (core 1) : `audio_pump` (I2S temps réel + bascule de sens),
+    `audio_rx` (décodage), `audio_tx` (encodage), `audio_ctl` (PTT / squelch /
+    statut).
+  - `AUDIO_DEBUG` (config.h §7) imprime chaque seconde l'état complet de la
+    chaîne : handles RFCOMM, débits TX/RX, pertes, PTT, squelch, niveau ADC.
 - Réglages dans `src/config.h`, section 5.
+
+### Deux « cibles » derrière le pont audio
+
+Le pont audio est identique dans les deux modes de démarrage (voir README) ;
+seule la « cible » des broches change :
+
+- **Mode SA818** (`src/Sa818.h`) : un module RF SA818/DRA818 a répondu à
+  `AT+DMOCONNECT` au boot. `BenshiCommandHandler` retune le module
+  (`AT+DMOSETGROUP`) à chaque changement de canal / VFO
+  (`RadioState::activeRf()` décode fréquences / CTCSS / bande passante du canal
+  actif). Le retune est **différé** : `process()` (contexte Bluetooth) pose un
+  drapeau, `DualRfcommServers::poll()` (boucle Arduino) fait l'I/O UART.
+- **Mode UV-K1** : aucun module. Fréquences purement simulées ; l'ESP ne peut
+  que passer l'audio et piloter PTT / lire squelch d'un poste externe.
 
 ## Notifications de statut liées à l'audio
 
@@ -97,13 +125,22 @@ Concurrence : ces hooks tournent dans les tâches audio et lisent `RadioState`
 pendant que la tâche Bluetooth peut l'écrire (`WRITE_*`). Lecture potentiellement
 « déchirée » mais sans gravité — la notification suivante corrige la valeur.
 
-## Reste à valider sur matériel
+## État (validé sur carte kv4p-ht v1 + SA818)
 
-- Le mode **ADC + DAC internes simultané** de l'ESP32 (un seul I2S0) est
-  bruyant et sensible au format d'échantillon (`I2S_CHANNEL_FMT_*`,
-  décalage 8 bits du DAC, masquage 12 bits de l'ADC). Code calqué sur
-  l'exemple ESP-IDF `i2s_adc_dac`, à ajuster à l'oreille.
-- Sortie DAC 8 bits → **ampli externe indispensable** (PAM8302 / LM386).
-- Entrée ADC → **préampli micro + polarisation ~1,65 V** indispensables.
-- Vérifier le type de trame (`0x00` vs `0x03`) réellement attendu par
-  HTCommander pour l'audio *venant* de la radio simulée.
+- Réception (SA818 → HTCommander) et émission (HTCommander → SA818) audio OK.
+- ADC réel mesuré ≈ 31,7–31,9 kHz (≈ 32 000, écart négligeable).
+- `SBC_Encoder_Init()` de Bluedroid **recalcule le bitpool depuis `u16BitRate`**
+  pour un flux mono → il faut fournir le bon bitrate (176 kbps ici pour
+  bitpool 40) puis re-forcer `s16BitPool`. Sinon trames SBC vides de ~9 octets.
+- `esp_spp_write` en mode callback : **une seule écriture en vol** (attendre
+  `ESP_SPP_WRITE_EVT`), et regrouper plusieurs trames SBC par écriture sinon
+  RFCOMM sature (`ESP_SPP_CONG_EVT`).
+- Bascule ADC↔DAC : le mutex récursif `adc1_i2s_lock` doit être pris **et**
+  rendu par la même tâche → tout l'I2S est géré depuis `audio_pump`.
+
+### Pistes d'amélioration
+
+- Émission via DAC 8 bits → bruit de quantification. `AUDIO_DAC_LOWPASS` (filtre
+  logiciel 1 pôle) ou sortie PDM + filtre RC (comme kv4p-ht) pour faire mieux.
+- Le type de trame audio *venant* de la radio est `0x00` (confirmé : HTCommander
+  décode `0x00` et `0x03` de la même façon).

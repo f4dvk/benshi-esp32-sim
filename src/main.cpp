@@ -4,7 +4,9 @@
 
 #if USE_DUAL_RFCOMM_SERVERS
     #include "DualRfcommServers.h"
+    #include "Sa818.h"
     DualRfcommServers rfcomm;
+    Sa818 rfModule;
 #else
     #include "AudioRfcomm.h"
     BenshiAudioLink rfcomm;
@@ -36,7 +38,22 @@ void setup() {
 #endif
 
 #if USE_DUAL_RFCOMM_SERVERS
-    if (!rfcomm.begin()) {
+    // Choix du mode : sonde un module RF SA818/DRA818 sur l'UART RF.
+    Sa818* rf = nullptr;
+#if RF_MODULE_ENABLE
+    Serial.println("[MODE] Recherche d'un module RF SA818/DRA818...");
+    if (rfModule.begin(RF_MODULE_UART_RX, RF_MODULE_UART_TX,
+                       RF_MODULE_PD_GPIO, RF_MODULE_PROBES)) {
+        rf = &rfModule;
+        Serial.println("[MODE] === SA818 : pilotage d'un module RF reel ===");
+    } else {
+        Serial.println("[MODE] === UV-K1 : simulation + passerelle vers poste externe ===");
+    }
+#else
+    Serial.println("[MODE] === UV-K1 : sonde SA818 desactivee (RF_MODULE_ENABLE=false) ===");
+#endif
+
+    if (!rfcomm.begin(rf)) {
         Serial.println("[FATAL] Demarrage Bluetooth Classic impossible (voir erreurs ci-dessus).");
         Serial.println("        Verifie que la carte est bien un ESP32 'classique' (WROOM-32 /");
         Serial.println("        DevKitC / WROVER) : les S3/C3/C6 n'ont pas de Bluetooth Classic.");
@@ -57,8 +74,10 @@ void setup() {
 }
 
 void loop() {
-#if !USE_DUAL_RFCOMM_SERVERS
-    rfcomm.loop(); // DualRfcommServers est piloté par callback, rien à boucler ici
+#if USE_DUAL_RFCOMM_SERVERS
+    rfcomm.poll();  // retune différé du module RF (mode SA818) ; no-op sinon
+#else
+    rfcomm.loop();
 #endif
-    delay(2);
+    delay(5);
 }

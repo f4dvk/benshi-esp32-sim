@@ -14,6 +14,7 @@
 
 #include "driver/i2s.h"
 #include "driver/adc.h"
+#include "driver/dac.h"
 
 // ============================================================================
 // Pont audio : canal RFCOMM audio (SBC, Bluetooth) <-> poste réel (ex. Quansheng
@@ -35,9 +36,9 @@
 // internes). Half-duplex logique : pendant l'émission vers le poste, la capture
 // ADC -> HTCommander est inhibée.
 //
-// ATTENTION : mode ADC+DAC interne simultané non validé sur matériel ; l'étage
-// analogique (atténuateur DAC->micro, adaptation HP->ADC) est à faire côté
-// matériel. La chaîne SBC + framing + files est indépendante du matériel.
+// Validé sur matériel (carte kv4p-ht v1 + SA818). ADC et DAC internes partagent
+// l'I2S0 -> bascule half-duplex a chaque PTT (voir applyIoMode). L'etage
+// analogique (atténuateur DAC->micro, polarisation HP->ADC) est cote materiel.
 // ============================================================================
 
 class AudioBridge {
@@ -66,7 +67,9 @@ public:
                       encoder_.frameLen(), (unsigned)sbc::kSamplesPerFrame);
 
         setupGpio();
-        if (!startI2s()) return false;
+        // NB : l'I2S est installe DEPUIS la tache pumpLoop, pas ici. Le pilote
+        // ADC interne prend un mutex RECURSIF (adc1_i2s_lock) qui doit etre
+        // pris ET rendu par la MEME tache -> sinon assert au 1er passage TX.
 
         xTaskCreatePinnedToCore(&AudioBridge::pumpTrampoline, "audio_pump", 4096, this, 6, &pumpTask_, 1);
         xTaskCreatePinnedToCore(&AudioBridge::rxTrampoline,   "audio_rx",   4096, this, 5, &rxTask_,   1);
@@ -97,8 +100,10 @@ public:
 #endif
     }
 
-    bool txToRadio() const   { return hcTxActive_.load(); }
-    bool rxFromRadio() const  { return micGateOpen_.load(); }
+    bool txToRadio() const    { return hcTxActive_.load(); }
+    bool rxFromRadio() const   { return micGateOpen_.load(); }
+    bool squelchRaw() const    { return sqDbg_.load(); }
+    uint32_t adcLevel() const  { return adcLevel_.load(); }
 
 private:
     // ---------------- File PCM (SPSC lock-free, capacité = puissance de 2) --
@@ -186,92 +191,137 @@ private:
 #endif
     }
 
-    // ---------------- I2S ------------------------------------------------
-    bool startI2s() {
-        int mode = I2S_MODE_MASTER;
-#if AUDIO_DAC_ENABLE
-        mode |= I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN;
+    // ---------------- I2S half-duplex (ADC <-> DAC sur I2S0) ------------
+    // Sur ESP32, ADC et DAC internes partagent I2S0 : on ne peut activer que
+    // l'un OU l'autre. On (ré)installe le pilote I2S0 dans le bon sens à chaque
+    // bascule PTT (comme kv4p-ht). Ces appels ne se font QUE dans pumpLoop().
+    enum IoMode : uint8_t { IO_NONE, IO_RX, IO_TX };
+
+    bool installRx() {
+#if AUDIO_ADC_BIAS_ENABLE
+        dac_output_enable(DAC_CHANNEL_2);                 // GPIO26 : polarisation entrée ADC
+        dac_output_voltage(DAC_CHANNEL_2, AUDIO_ADC_BIAS_CODE);
 #endif
-#if AUDIO_ADC_ENABLE
-        mode |= I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN;
+        // Config alignée sur arduino-audio-tools (AnalogDriverESP32), la lib
+        // audio de kv4p-ht : mono RX = ONLY_LEFT, communication_format = 0.
+        i2s_config_t cfg = {};
+        cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_ADC_BUILT_IN);
+        cfg.sample_rate          = AUDIO_SAMPLE_RATE_HZ;
+        cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
+        cfg.channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT;
+        cfg.communication_format = (i2s_comm_format_t)0;
+        cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
+        cfg.dma_buf_count        = 6;
+        cfg.dma_buf_len          = kFrame;
+        cfg.use_apll             = AUDIO_I2S_APLL;
+        esp_err_t e = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
+        if (e != ESP_OK) { Serial.printf("[AUDIO] install RX -> %s\n", esp_err_to_name(e)); return false; }
+        adc1_config_channel_atten((adc1_channel_t)AUDIO_ADC_CHANNEL, ADC_ATTEN_DB_12);
+        i2s_set_adc_mode(ADC_UNIT_1, (adc1_channel_t)AUDIO_ADC_CHANNEL);
+        i2s_adc_enable(I2S_NUM_0);
+        i2s_zero_dma_buffer(I2S_NUM_0);
+        return true;
+    }
+
+    bool installTx() {
+#if AUDIO_ADC_BIAS_ENABLE
+        dac_output_disable(DAC_CHANNEL_2);
 #endif
         i2s_config_t cfg = {};
-        cfg.mode = (i2s_mode_t)mode;
+        cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN);
         cfg.sample_rate          = AUDIO_SAMPLE_RATE_HZ;
         cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
         cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
-        cfg.communication_format = I2S_COMM_FORMAT_STAND_MSB;
+        cfg.communication_format = (i2s_comm_format_t)0;
         cfg.intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1;
-        cfg.dma_buf_count        = 8;
+        cfg.dma_buf_count        = 6;
         cfg.dma_buf_len          = kFrame;
-        cfg.use_apll             = false;
+        cfg.use_apll             = AUDIO_I2S_APLL;
         cfg.tx_desc_auto_clear   = true;
-
         esp_err_t e = i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr);
-        if (e != ESP_OK) {
-            Serial.printf("[AUDIO] i2s_driver_install -> %s\n", esp_err_to_name(e));
-            return false;
-        }
-#if AUDIO_ADC_ENABLE
-        i2s_set_adc_mode(ADC_UNIT_1, (adc1_channel_t)AUDIO_ADC_CHANNEL);
-        adc1_config_channel_atten((adc1_channel_t)AUDIO_ADC_CHANNEL, ADC_ATTEN_DB_12);
-#endif
-        i2s_set_pin(I2S_NUM_0, nullptr);   // NULL -> DAC interne GPIO25 + GPIO26
-#if AUDIO_DAC_ENABLE
-        i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
-#endif
-#if AUDIO_ADC_ENABLE
-        i2s_adc_enable(I2S_NUM_0);
-#endif
+        if (e != ESP_OK) { Serial.printf("[AUDIO] install TX -> %s\n", esp_err_to_name(e)); return false; }
+        i2s_set_pin(I2S_NUM_0, nullptr);                  // NULL -> DAC interne
+        // GPIO25 seul : sur la carte kv4p-ht, GPIO26 fait partie du reseau de
+        // polarisation ADC -> ne pas y sortir d'audio pendant l'emission.
+        i2s_set_dac_mode(I2S_DAC_CHANNEL_RIGHT_EN);       // GPIO25 = AUDIO_OUT
+        i2s_set_sample_rates(I2S_NUM_0, AUDIO_SAMPLE_RATE_HZ);
         i2s_zero_dma_buffer(I2S_NUM_0);
         return true;
+    }
+
+    // TOUJOURS appelee depuis pumpLoop() (contrainte du mutex ADC recursif).
+    void applyIoMode(IoMode want) {
+        if (ioMode_ == want) return;
+
+        if (ioMode_ == IO_RX) i2s_adc_disable(I2S_NUM_0);   // rend adc1_i2s_lock (meme tache)
+        if (ioMode_ != IO_NONE) {
+            i2s_driver_uninstall(I2S_NUM_0);
+            vTaskDelay(pdMS_TO_TICKS(5));                    // laisse l'ISR/DMA se poser
+        }
+        bool ok = (want == IO_TX) ? installTx() : installRx();  // i2s_driver_install demarre l'I2S
+        ioMode_ = ok ? want : IO_NONE;
+#if AUDIO_DEBUG
+        Serial.printf("[AUDIO] I2S0 -> %s%s\n",
+                      want == IO_TX ? "SORTIE DAC (emission)" : "ENTREE ADC (reception)",
+                      ok ? "" : "  !! ECHEC");
+#endif
     }
 
     // ---------------- Tâche "pompe" I2S (timing temps réel) -------------
     static void pumpTrampoline(void* self) { static_cast<AudioBridge*>(self)->pumpLoop(); }
     void pumpLoop() {
-        int16_t  play[kFrame];
-        uint16_t dac[kFrame * 2];
         uint16_t adc[kFrame];
         int16_t  mic[kFrame];
+        int16_t  play[kFrame];
+        uint16_t dac[kFrame * 2];
         size_t   n = 0;
 
         for (;;) {
-#if AUDIO_ADC_ENABLE
-            if (i2s_read(I2S_NUM_0, adc, sizeof(adc), &n, portMAX_DELAY) == ESP_OK && n) {
-                size_t cnt = n / sizeof(uint16_t);
-                uint32_t absSum = 0;
-                bool gate = micGateOpen_.load();
-                for (size_t i = 0; i < cnt; i++) {
-                    int raw = adc[i] & 0x0FFF;                 // 12 bits utiles
+            applyIoMode(wantTx_.load() ? IO_TX : IO_RX);
+
+            if (ioMode_ == IO_RX) {
+                if (i2s_read(I2S_NUM_0, adc, sizeof(adc), &n, pdMS_TO_TICKS(30)) == ESP_OK && n) {
+                    size_t cnt = n / sizeof(uint16_t);
+                    uint32_t absSum = 0;
+                    bool gate = micGateOpen_.load();
+                    for (size_t i = 0; i < cnt; i++) {
+                        int raw = adc[i] & 0x0FFF;
 #if AUDIO_MIC_DC_TRACK
-                    micDc_ += (raw - micDc_) * 0.0015f;        // suivi lent du biais
+                        micDc_ += (raw - micDc_) * 0.0015f;
 #else
-                    micDc_ = 2048.0f;
+                        micDc_ = 2048.0f;
 #endif
-                    float s = (raw - micDc_) * (AUDIO_MIC_GAIN * 16.0f);
-                    int16_t v = s > 32767.f ? 32767 : (s < -32768.f ? -32768 : (int16_t)s);
-                    mic[i] = v;
-                    absSum += (uint32_t)(v < 0 ? -v : v);
+                        float s = (raw - micDc_) * (AUDIO_MIC_GAIN * 16.0f);
+                        int16_t v = s > 32767.f ? 32767 : (s < -32768.f ? -32768 : (int16_t)s);
+                        mic[i] = v;
+                        absSum += (uint32_t)(v < 0 ? -v : v);
+                    }
+                    if (cnt) {
+                        uint32_t mean = absSum / cnt;
+                        adcEnv_ += ((float)mean - adcEnv_) * 0.25f;
+                        adcLevel_.store((uint32_t)adcEnv_);
+                        adcSamples_.fetch_add(cnt);
+                    }
+                    if (gate) micRing_.write(mic, cnt);
                 }
-                if (cnt) {
-                    uint32_t mean = absSum / cnt;              // |PCM| moyen 0..32767
-                    // Lissage ~30 ms puis publication pour la VOX / le RSSI.
-                    adcEnv_ += ((float)mean - adcEnv_) * 0.25f;
-                    adcLevel_.store((uint32_t)adcEnv_);
-                }
-                if (gate) micRing_.write(mic, cnt);           // capture seulement si RX ouvert
-            }
+            } else if (ioMode_ == IO_TX) {
+                size_t got = playRing_.read(play, kFrame);
+                for (size_t i = 0; i < kFrame; i++) {
+                    float in = (i < got) ? (play[i] * AUDIO_SPK_VOLUME) : 0.f;
+#if AUDIO_DAC_LOWPASS
+                    dacLp_ += (in - dacLp_) * (float)AUDIO_DAC_LP_ALPHA;   // adoucit l'escalier 8 bits
+                    in = dacLp_;
 #endif
-            size_t got = playRing_.read(play, kFrame);
-            for (size_t i = 0; i < kFrame; i++) {
-                int32_t p = (i < got) ? (int32_t)(play[i] * AUDIO_SPK_VOLUME) : 0;
-                uint16_t u8 = (uint16_t)(((p >> 8) + 128) & 0xFF);   // 8 bits DAC
-                uint16_t w  = (uint16_t)(u8 << 8);
-                dac[2 * i]     = w;   // GPIO26
-                dac[2 * i + 1] = w;   // GPIO25
+                    int32_t p = (int32_t)in;
+                    if (p > 32767) p = 32767; else if (p < -32768) p = -32768;
+                    uint16_t w = (uint16_t)(p + 0x8000);           // 16b non signé, DAC = 8 MSB
+                    dac[2 * i] = w;
+                    dac[2 * i + 1] = w;                            // GPIO25
+                }
+                i2s_write(I2S_NUM_0, dac, sizeof(dac), &n, pdMS_TO_TICKS(50));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(10));
             }
-            i2s_write(I2S_NUM_0, dac, sizeof(dac), &n, portMAX_DELAY);
         }
     }
 
@@ -318,9 +368,17 @@ private:
             if (micRing_.available() < kFrame) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
             micRing_.read(frame, kFrame);
             size_t len = encoder_.encodeFrame(frame, sbcOut, sizeof(sbcOut));
-            if (len && txFrameCb_) txFrameCb_(sbcOut, len);
+            if (len) {
+                encFrames_.fetch_add(1);
+                if (txFrameCb_) txFrameCb_(sbcOut, len);
+            }
         }
     }
+
+public:
+    uint32_t encFramesTake() { return encFrames_.exchange(0); }  // trace : trames SBC produites
+    uint32_t adcSamplesTake() { return adcSamples_.exchange(0); } // trace : ech. ADC lus (=> Hz reel)
+private:
 
     // ---------------- Tâche de contrôle : PTT, squelch, statut ----------
     static void ctlTrampoline(void* self) { static_cast<AudioBridge*>(self)->ctlLoop(); }
@@ -337,11 +395,19 @@ private:
 
             // --- PTT vers le poste : actif tant que HTCommander envoie ---
             bool tx = (now - lastRadioSbcMs_.load()) < (uint32_t)AUDIO_PTT_TAIL_MS;
+            wantTx_.store(tx);                         // pumpLoop bascule I2S0 ADC<->DAC
             if (tx != txPrev) {
                 txPrev = tx;
                 hcTxActive_.store(tx);
                 pttWrite(tx);
                 if (txStateCb_) txStateCb_(tx);
+#if AUDIO_DEBUG
+                Serial.printf("[AUDIO] PTT %s  (GPIO%d = %s)\n",
+                              tx ? "ON (HTCommander emet)" : "OFF",
+                              (int)AUDIO_PTT_GPIO,
+                              (AUDIO_PTT_GPIO < 0) ? "n/a"
+                                  : ((tx == AUDIO_PTT_ACTIVE_LOW) ? "LOW" : "HIGH"));
+#endif
             }
 
             // --- VOX (si pas de fil squelch) : hystérésis + traîne 400 ms ---
@@ -353,6 +419,7 @@ private:
 #endif
             // --- Squelch débruité (25 ms) ---
             bool sqRaw = squelchHwOpen() || physPttPressed();
+            sqDbg_.store(sqRaw);
             if (sqRaw != sqStable) {
                 if (sqSinceMs == 0) sqSinceMs = now;
                 else if (now - sqSinceMs > 25) { sqStable = sqRaw; sqSinceMs = 0; }
@@ -367,6 +434,11 @@ private:
             rxGatePrev = rxGate;
             if (rxOpened || rxClosed) micGateOpen_.store(rxGate);
             if (rxClosed && txEndCb_) txEndCb_();               // AudioEnd -> HTCommander
+#if AUDIO_DEBUG
+            if (rxOpened) Serial.printf("[AUDIO] RX poste : squelch OUVERT -> capture ADC (niveau %lu)\n",
+                                        (unsigned long)adcLevel_.load());
+            if (rxClosed) Serial.println("[AUDIO] RX poste : squelch fermé -> AudioEnd");
+#endif
 
             // --- RSSI 0..15 dérivé du niveau ADC ---
             if (rxGate) {
@@ -410,9 +482,15 @@ private:
     std::atomic<uint32_t> adcLevel_{0};         // |PCM| moyen lissé (0..32767)
     std::atomic<bool>     hcTxActive_{false};   // émission vers le poste en cours
     std::atomic<bool>     micGateOpen_{false};  // capture ADC -> HTCommander ouverte
+    std::atomic<bool>     sqDbg_{false};        // état brut du squelch (trace)
+    std::atomic<uint32_t> encFrames_{0};        // trames SBC produites par txLoop
+    std::atomic<uint32_t> adcSamples_{0};       // echantillons ADC lus (=> Hz reel)
+    std::atomic<bool>     wantTx_{false};       // sens I2S0 demandé (pumpLoop applique)
+    IoMode                ioMode_ = IO_NONE;    // sens I2S0 courant (pumpLoop uniquement)
 
     float    micDc_ = 2048.0f;
     float    adcEnv_ = 0.0f;
+    float    dacLp_ = 0.0f;
     bool     vox_ = false;
     uint32_t voxLoudMs_ = 0;
 };

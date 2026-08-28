@@ -40,6 +40,7 @@ public:
 private:
     void* params_ = nullptr;   // SBC_ENC_PARAMS*
     int   frameLen_ = 0;
+    int   bitpool_ = 0;
 };
 
 // ----------------------------------------------------------------------------
