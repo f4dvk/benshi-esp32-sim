@@ -273,12 +273,25 @@ private:
             tft_.text(6,  MODE_Y, "FM", C_WHITE, BG, 1);
             tft_.text(28, MODE_Y, f.wide ? "W 25k" : "N 12k", LBL, BG, 1);
         }
-        // ---- heure UTC (GPS) sur la ligne mode ----
-        if (F || strcmp(f.utc, c_.utc)) {
-            char t[16];
-            snprintf(t, sizeof(t), "UTC %s", f.utc[0] ? f.utc : "--:--:--");
-            tft_.fillRect(92, MODE_Y, 100, 8, BG);
-            tft_.text(94, MODE_Y, t, f.utc[0] ? OKG : DIM, BG, 1);
+        // ---- heure UTC (GPS) : ne redessine que les caractères qui changent
+        //      (typiquement le chiffre des secondes) ----
+        {
+            const char* now = f.utc[0] ? f.utc : "--:--:--";   // toujours 8 car.
+            bool valid   = (f.utc[0] != 0);
+            bool valChg  = (valid != utcValid_);
+            if (F || valChg) {
+                tft_.text(94, MODE_Y, "UTC ", LBL, BG, 1);      // préfixe fixe
+                utcValid_ = valid;
+            }
+            uint16_t col = valid ? OKG : DIM;
+            const int x0 = 94 + 4 * 6;                          // juste après "UTC "
+            for (int i = 0; i < 8; i++) {
+                if (F || valChg || now[i] != utcShown_[i]) {
+                    char s[2] = { now[i], 0 };
+                    tft_.text(x0 + i * 6, MODE_Y, s, col, BG, 1);
+                    utcShown_[i] = now[i];
+                }
+            }
         }
 
         // ---- S-mètre : barre proportionnelle, calée sur l'échelle Icom ----
@@ -401,6 +414,8 @@ private:
     SemaphoreHandle_t mtx_ = nullptr;
     RadioFace pending_, c_;
     bool     first_ = true;
+    char     utcShown_[9] = {0};            // caractères UTC actuellement affichés
+    bool     utcValid_ = false;
     uint8_t  dgPrev_[7][DM_ROWS] = {{0}};   // état matrice de chaque chiffre
     // Tampon de tracé partagé : un chiffre (25x45) OU une bande de spectre
     // (SP_PW x SP_STRIP). Dimensionné pour le plus grand des deux.
