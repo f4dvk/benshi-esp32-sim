@@ -52,6 +52,14 @@ public:
     uint8_t sats()   const { return hasFix() ? sats_ : 0; }
     uint8_t fixType() const { return hasFix() ? fixType_ : 0; }   // 0/2/3
 
+    // Heure UTC (issue du GPS) si reçue depuis moins de APRS_GPS_FIX_MAX_AGE_S.
+    bool utc(uint8_t& h, uint8_t& m, uint8_t& s) const {
+        if (!haveUtc_) return false;
+        if (millis() - utcMs_ > (uint32_t)APRS_GPS_FIX_MAX_AGE_S * 1000UL) return false;
+        h = utcH_; m = utcM_; s = utcS_;
+        return true;
+    }
+
 private:
     // Découpe en champs séparés par des virgules (destructif sur line_).
     int split(char* fields[], int maxf) {
@@ -84,11 +92,13 @@ private:
         int nf = split(f, 20);
 
         if (!strncmp(t, "RMC", 3) && nf >= 7) {
+            parseUtc(f[1]);
             bool valid = (f[2][0] == 'A');
             double lat = nmeaToDeg(f[3], f[4]);
             double lon = nmeaToDeg(f[5], f[6]);
             if (valid && !isnan(lat) && !isnan(lon)) store(lat, lon);
         } else if (!strncmp(t, "GGA", 3) && nf >= 8) {
+            parseUtc(f[1]);
             int quality = atoi(f[6]);
             sats_ = (uint8_t)atoi(f[7]);
             double lat = nmeaToDeg(f[2], f[3]);
@@ -97,6 +107,20 @@ private:
         } else if (!strncmp(t, "GSA", 3) && nf >= 3) {
             fixType_ = (uint8_t)atoi(f[2]);   // 1=aucun, 2=2D, 3=3D
         }
+    }
+
+    // Champ NMEA "hhmmss.sss" -> heure UTC.
+    void parseUtc(const char* v) {
+        if (!v) return;
+        size_t n = 0; while (v[n] && v[n] != '.') n++;
+        if (n < 6) return;
+        for (int i = 0; i < 6; i++) if (v[i] < '0' || v[i] > '9') return;
+        utcH_ = (v[0] - '0') * 10 + (v[1] - '0');
+        utcM_ = (v[2] - '0') * 10 + (v[3] - '0');
+        utcS_ = (v[4] - '0') * 10 + (v[5] - '0');
+        if (utcH_ > 23 || utcM_ > 59 || utcS_ > 59) return;
+        utcMs_ = millis();
+        haveUtc_ = true;
     }
 
     void store(double lat, double lon) {
@@ -113,6 +137,9 @@ private:
     bool     haveFix_ = false;
     uint8_t  sats_ = 0;
     uint8_t  fixType_ = 0;
+    uint8_t  utcH_ = 0, utcM_ = 0, utcS_ = 0;
+    uint32_t utcMs_ = 0;
+    bool     haveUtc_ = false;
 };
 
 #endif  // APRS_GPS_ENABLE

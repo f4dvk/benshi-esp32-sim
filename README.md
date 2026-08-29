@@ -248,7 +248,7 @@ séparateur ; blanc en réception, rouge en émission), badge mode encadré,
 **S-mètre calé sur l'échelle Icom** (S1–S9 en vert puis +20/+40/+60 en rouge),
 **analyseur de spectre de l'audio reçu** (FFT 256 points, 0–3 kHz, tracé en
 courbe colorée vert→ambre→rouge selon l'amplitude ; `DISPLAY_SPECTRUM`),
-bloc de statut, barre GPS/BT.
+**heure UTC du GPS** (ligne mode), bloc de statut, barre GPS/BT.
 Affichage **passif** (lecture seule). Pendant l'émission d'une balise APRS,
 la fréquence affichée est celle du **canal APRS** (canal réellement utilisé
 pour la trame), pas celle du canal écouté, et le bloc de statut indique

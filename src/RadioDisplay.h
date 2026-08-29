@@ -31,6 +31,7 @@ struct RadioFace {
     bool    bt        = false;
     uint8_t gpsFix    = 0;      // 0 / 2 / 3
     uint8_t gpsSats   = 0;
+    char    utc[9]    = {0};    // "HH:MM:SS" (GPS), vide si indisponible
 };
 
 class RadioDisplay {
@@ -258,6 +259,13 @@ private:
             tft_.fillRect(4, MODE_Y, 78, 9, BG);
             tft_.text(6,  MODE_Y, "FM", C_WHITE, BG, 1);
             tft_.text(28, MODE_Y, f.wide ? "W 25k" : "N 12k", LBL, BG, 1);
+        }
+        // ---- heure UTC (GPS) sur la ligne mode ----
+        if (F || strcmp(f.utc, c_.utc)) {
+            char t[16];
+            snprintf(t, sizeof(t), "UTC %s", f.utc[0] ? f.utc : "--:--:--");
+            tft_.fillRect(92, MODE_Y, 100, 8, BG);
+            tft_.text(94, MODE_Y, t, f.utc[0] ? OKG : DIM, BG, 1);
         }
 
         // ---- S-mètre : barre proportionnelle, calée sur l'échelle Icom ----

@@ -235,6 +235,11 @@ public:
 #if (TNC_ENABLE && APRS_GPS_ENABLE)
         f.gpsFix    = gps_.fixType();
         f.gpsSats   = gps_.sats();
+        {
+            uint8_t uh, um, us;
+            if (gps_.utc(uh, um, us))
+                snprintf(f.utc, sizeof(f.utc), "%02u:%02u:%02u", uh, um, us);
+        }
 #endif
         display_.set(f);
     }
