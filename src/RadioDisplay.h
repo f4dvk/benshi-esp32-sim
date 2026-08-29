@@ -3,36 +3,21 @@
 #include <Wire.h>
 #include "config.h"
 
-#if DISPLAY_ENABLE
+#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_ILI9225)
 
 #include <functional>
+#include "RadioFace.h"
 #include "Mcp23017.h"
 #include "Ili9225.h"
 #include "AudioSpectrum.h"
 
 // ============================================================================
-// Écran de façade "portatif VHF", look Yaesu (ILI9225 / MCP23017).
+// Écran de façade "portatif VHF", look Icom (ILI9225 / MCP23017).
 //
 // Affichage passif. Le transport SPI (bit-bangé via I2C, OU matériel si
 // ILI9225_HW_SPI) est lent -> on ne redessine QUE ce qui change, au segment /
 // au caractère près. Tâche FreeRTOS dédiée, priorité basse.
 // ============================================================================
-
-struct RadioFace {
-    double  rxMHz     = 0.0;
-    uint8_t channelId = 0;
-    char    channel[12] = {0};
-    bool    wide      = true;
-    bool    highPower  = true;
-    uint8_t sMeter    = 0;      // 0..9
-    bool    sqOpen    = false;
-    bool    tx        = false;
-    bool    txAprs    = false;  // émission = balise APRS autonome
-    bool    bt        = false;
-    uint8_t gpsFix    = 0;      // 0 / 2 / 3
-    uint8_t gpsSats   = 0;
-    char    utc[9]    = {0};    // "HH:MM:SS" (GPS), vide si indisponible
-};
 
 class RadioDisplay {
 public:
@@ -419,4 +404,4 @@ private:
 #endif
 };
 
-#endif  // DISPLAY_ENABLE
+#endif  // DISPLAY_ENABLE && DISPLAY_DRIVER == ILI9225

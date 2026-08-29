@@ -19,17 +19,32 @@
 
 #if APRS_GPS_ENABLE
 
+// L'écran Nextion occupe Serial1 -> le GPS passe alors sur un UART logiciel
+// (RX seul). Sinon il garde le port matériel Serial1.
+#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_NEXTION)
+#include <SoftwareSerial.h>
+#define GPS_USE_SOFTSERIAL 1
+#endif
+
 class GpsNmea {
 public:
     void begin() {
+#if GPS_USE_SOFTSERIAL
+        ss_.begin(APRS_GPS_BAUD, SWSERIAL_8N1, NEXTION_GPS_SOFT_RX_GPIO, -1);
+        ser_ = &ss_;
+        Serial.printf("[GPS] NMEA sur SoftwareSerial RX=GPIO%d @ %d bauds "
+                      "(Nextion occupe Serial1)\n", NEXTION_GPS_SOFT_RX_GPIO, APRS_GPS_BAUD);
+#else
         Serial1.begin(APRS_GPS_BAUD, SERIAL_8N1, APRS_GPS_RX_GPIO, APRS_GPS_TX_GPIO);
+        ser_ = &Serial1;
         Serial.printf("[GPS] NMEA sur Serial1 RX=GPIO%d @ %d bauds\n",
                       APRS_GPS_RX_GPIO, APRS_GPS_BAUD);
+#endif
     }
 
     void poll() {
-        while (Serial1.available()) {
-            char c = (char)Serial1.read();
+        while (ser_ && ser_->available()) {
+            char c = (char)ser_->read();
             if (c == '\n' || c == '\r') {
                 if (len_ > 6) parseLine();
                 len_ = 0;
@@ -86,6 +101,15 @@ private:
 
     void parseLine() {
         if (line_[0] != '$') return;
+        // Checksum NMEA "$....*HH" : indispensable sur SoftwareSerial (octets
+        // parfois perdus sous forte charge d'interruptions Bluetooth).
+        char* star = strchr(line_, '*');
+        if (star && star[1] && star[2]) {
+            uint8_t cs = 0;
+            for (char* p = line_ + 1; p < star; p++) cs ^= (uint8_t)*p;
+            if (cs != (uint8_t)strtol(star + 1, nullptr, 16)) return;
+            *star = '\0';
+        }
         // type = 3 lettres après le "talker" (ex. GPRMC, GNRMC) -> line_[3..5]
         const char* t = line_ + 3;
         char* f[20];
@@ -130,6 +154,10 @@ private:
         haveFix_ = true;
     }
 
+#if GPS_USE_SOFTSERIAL
+    SoftwareSerial ss_;
+#endif
+    Stream*  ser_ = nullptr;
     char     line_[100];
     size_t   len_ = 0;
     double   lat_ = 0, lon_ = 0;

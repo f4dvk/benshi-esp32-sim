@@ -15,6 +15,12 @@
 #include "AprsBeacon.h"
 #include "GpsNmea.h"
 #include "RadioDisplay.h"
+#include "NextionDisplay.h"
+#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_NEXTION)
+using FaceDisplay = NextionDisplay;
+#elif DISPLAY_ENABLE
+using FaceDisplay = RadioDisplay;
+#endif
 #include "freertos/stream_buffer.h"
 
 // ============================================================================
@@ -181,9 +187,9 @@ public:
 #endif
 
 #if DISPLAY_ENABLE
-        // 9) Ecran de facade (ILI9225 / MCP23017).
-        // Demarrage DIFFERE (voir poll()) : l'init I2C + le trafic de la tache
-        // d'affichage ne doivent pas concurrencer la publication du service SDP
+        // 9) Ecran de facade (ILI9225/MCP23017 ou Nextion/UART, cf DISPLAY_DRIVER).
+        // Demarrage DIFFERE (voir poll()) : l'init de l'ecran et le trafic de sa
+        // tache ne doivent pas concurrencer la publication du service SDP
         // pendant l'appairage.
 #if DISPLAY_SPECTRUM
         display_.setPcmSource([this](int16_t* out) { audio_.copySpectrumPcm(out); });
@@ -810,7 +816,7 @@ private:
     AudioBridge audio_;
     Sa818* rf_ = nullptr;
 #if DISPLAY_ENABLE
-    RadioDisplay display_;
+    FaceDisplay  display_;
     uint32_t     dispFeedMs_ = 0;
     bool         displayStarted_ = false;
 #endif

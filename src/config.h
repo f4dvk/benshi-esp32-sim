@@ -488,6 +488,22 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // le Bluetooth.
 // ----------------------------------------------------------------------
 #define DISPLAY_ENABLE            true
+
+// --- Choix du pilote d'écran ---------------------------------------------
+#define DISPLAY_DRIVER_ILI9225   0   // TFT ILI9225 176x220 via MCP23017 (SPI)
+#define DISPLAY_DRIVER_NEXTION   1   // écran "intelligent" Nextion (UART)
+#define DISPLAY_DRIVER           DISPLAY_DRIVER_NEXTION
+
+// --- Nextion NX4827T043 (480x272, UART ; adaptation 5V<->3,3V externe) ---
+// L'ESP32 n'a que 3 UART : USB(debug) + SA818(Serial2) + GPS(Serial1). Le
+// Nextion prend donc Serial1 ; si le GPS est actif il bascule sur un UART
+// LOGICIEL (SoftwareSerial, RX seul) -> voir NEXTION_GPS_SOFT_RX_GPIO.
+#define NEXTION_RX_GPIO          4      // ESP RX  <- TX du Nextion (ancienne broche GPS)
+#define NEXTION_TX_GPIO          21     // ESP TX  -> RX du Nextion (ex-I2C, libre sans MCP)
+#define NEXTION_BAUD             115200 // débit UART ; l'écran doit être réglé pareil (bauds=)
+#define NEXTION_GPS_SOFT_RX_GPIO 22     // GPS sur SoftwareSerial quand le Nextion est actif
+#define NEXTION_SPECTRUM_MS      150    // cadence d'envoi du spectre (waveform)
+
 #define DISPLAY_I2C_SDA           21
 #define DISPLAY_I2C_SCL           22
 #define DISPLAY_I2C_FREQ          1000000            // MCP23017 tient 1,7 MHz ; 800000 / 400000 si l'I2C n'est pas fiable

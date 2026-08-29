@@ -241,6 +241,51 @@ adaptateur serve aux deux projets.
 
 ### Écran de façade « portatif VHF »
 
+Deux pilotes au choix via **`DISPLAY_DRIVER`** dans `config.h` :
+
+| `DISPLAY_DRIVER` | Écran | Transport | Notes |
+|---|---|---|---|
+| `DISPLAY_DRIVER_ILI9225` | TFT ILI9225 176×220 | SPI matériel + MCP23017 (I2C) pour CS/RS/RST/LED | rendu maison, voir plus bas |
+| `DISPLAY_DRIVER_NEXTION` | Nextion NX4827T043 (480×272) | UART (`Serial1`) | rendu par l'écran ; le GPS bascule sur `SoftwareSerial` |
+
+Dans les deux cas l'affichage est **passif** (lecture seule) et démarre en
+**différé** (après publication du service SDP) pour ne pas gêner l'appairage.
+
+#### Nextion NX4827T043
+
+L'ESP n'a que 3 UART (USB debug + SA818 sur `Serial2` + GPS sur `Serial1`) :
+le Nextion prend **`Serial1`** et le GPS passe alors sur un **UART logiciel**
+(`SoftwareSerial`, RX seul) — d'où la dépendance `EspSoftwareSerial`.
+
+| Nextion | Vers | `config.h` |
+|---|---|---|
+| TX | `NEXTION_RX_GPIO` (**4**) de l'ESP | `NEXTION_RX_GPIO` |
+| RX | `NEXTION_TX_GPIO` (**21**) de l'ESP | `NEXTION_TX_GPIO` |
+| 5 V / GND | alim ; **adaptation de niveau 5 V ↔ 3,3 V externe** sur TX/RX | — |
+| (GPS TX) | `NEXTION_GPS_SOFT_RX_GPIO` (**22**) | — |
+
+`NEXTION_BAUD` = 115200 (le firmware tente de passer un écran neuf de 9600 à
+115200 au démarrage, `bauds=`). L'**interface `.HMI`** est à créer dans le
+**Nextion Editor** et à flasher séparément (carte SD ou upload série). `page0`
+doit contenir :
+
+| Objet | Type | Contenu poussé par l'ESP |
+|---|---|---|
+| `tFreq` | Text | fréquence `145.5000` (`.pco` rouge en émission) |
+| `tChan` | Text | `M04 APRS` |
+| `tMode` | Text | `FM  WIDE 25k` |
+| `tStat` | Text | `RX` / `TX` / `TX APRS` / `STBY` (`.pco` couleur) |
+| `tSq` `tPwr` `tBt` | Text | `SQ`, `HI`/`LO`, `BT` |
+| `tGps` | Text | `GPS 3D 08` |
+| `tUtc` | Text | `UTC 12:34:56` |
+| `jSig` | Progress bar | S-mètre 0–100 |
+| `sSpec` | Waveform | spectre audio, `.id` = `NEXTION_WAVE_ID` (déf. 2), largeur `NEXTION_WAVE_W` (240), hauteur `NEXTION_WAVE_H` (120), 1 canal |
+
+Le spectre est envoyé toutes les `NEXTION_SPECTRUM_MS` en mode transparent
+(`addt`), le reste seulement quand une valeur change.
+
+#### ILI9225
+
 Écran **ILI9225** (TFT 176×220) câblé sur un **expandeur GPIO MCP23017** (I2C),
 look **Icom IC-7760** : cadres cyan, **fréquence VFO en matrice de carrés**
 (LED dot-matrix 5×9 par chiffre, 6 chiffres MHz/kHz + unités kHz plus petites,
