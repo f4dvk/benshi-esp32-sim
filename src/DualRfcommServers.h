@@ -12,6 +12,8 @@
 #include "VendorSdpRecord.h"
 #include "AudioBridge.h"
 #include "TncModem.h"
+#include "AprsBeacon.h"
+#include "GpsNmea.h"
 #include "freertos/stream_buffer.h"
 
 // ============================================================================
@@ -170,6 +172,9 @@ public:
 
 #if TNC_ENABLE
         // 8) TNC AX.25 / AFSK 1200 pour le canal donnees "APRS".
+#if APRS_GPS_ENABLE
+        gps_.begin();
+#endif
         tncSetup();
         tncReconcile();
 #endif
@@ -192,7 +197,12 @@ public:
         handler_.pollRf();
         flushAudioCoalesce();
 #if TNC_ENABLE
+#if APRS_GPS_ENABLE
+        gps_.poll();
+#endif
         tncReconcile();
+        aprsBeaconTick();
+        aprsBeaconChannelRestore();
 #endif
 
         // Filet de securite (reconnexion) : une connexion est en attente depuis
@@ -732,6 +742,12 @@ private:
     TncModem tnc_;
     bool dataChanActive_ = false;                // radio sur le canal "APRS"
     uint32_t connUpSinceMs_ = 0;                 // date où COMMANDE+AUDIO tous deux mappés
+    uint32_t lastBeaconMs_ = 0;                  // dernière balise APRS autonome
+    uint8_t  beaconRestoreCh_ = 0xFF;            // canal à restaurer après balise (0xFF = rien)
+    uint32_t beaconTxStartMs_ = 0;
+#if APRS_GPS_ENABLE
+    GpsNmea gps_;
+#endif
     std::vector<uint8_t> tncTxAccum_;            // réassemblage HT_SEND_DATA
     int      tncTxNextFrag_ = 0;
     StreamBufferHandle_t tncTxQ_ = nullptr;      // trames AX.25 completes -> tache TX
@@ -832,7 +848,31 @@ private:
         if (!bothUp)                        connUpSinceMs_ = 0;
         bool stable = bothUp &&
                       (millis() - connUpSinceMs_ >= (uint32_t)TNC_START_DELAY_MS);
-        bool want = dataChanActive_ && stable;
+        bool clientish = (cmdHandle_ != 0 || pendingConn_ != 0);
+
+        // Le modem tourne pour : le canal DONNÉES APRS (client), OU la balise
+        // autonome activée ("Partager ma position") -> celle-ci peut émettre
+        // même si la radio écoute un autre canal (elle bascule sur le canal de
+        // balise le temps de la trame, cf auto_share_loc_ch).
+#if APRS_BEACON_ENABLE
+        bool beaconWanted = handler_.aprsConfig().shouldShareLocation();
+#else
+        bool beaconWanted = false;
+#endif
+        bool need = dataChanActive_ || beaconWanted;
+
+        // Décision :
+        //  - ni données ni balise           -> non
+        //  - déjà lancé                     -> on garde (balise/données), sinon
+        //                                       tant qu'un client est/était là
+        //  - aucun client en vue            -> oui (heap large, aucun risque L2CAP)
+        //  - un client s'établit            -> on attend la stabilité (anti-crash)
+        bool want;
+        if (!need)                want = false;
+        else if (tncRunning_)     want = true;
+        else if (!clientish)      want = true;
+        else                      want = stable;
+
         if (want && !tncRunning_) {
             tncStart();
         } else if (!want && tncRunning_) {
@@ -841,6 +881,124 @@ private:
             tncStop();
         }
         audio_.setDataMode(tncRunning_);
+    }
+
+    // Balise APRS autonome : trame de position générée par l'ESP, poussée dans
+    // la file du modem. Émet si "Partager ma position" est coché, quel que soit
+    // le canal écouté (bascule sur le canal de balise le temps de la trame).
+    void aprsBeaconTick() {
+#if APRS_BEACON_ENABLE
+        if (!tncRunning_ || !tncTxQ_) return;
+        // Connecté : on balise seulement si HTCommander a délégué le balisage à
+        // la radio (File > GPS -> il enregistre POSITION_CHANGE). Sinon c'est
+        // lui qui balise -> on se tait pour éviter le doublon.
+        bool clientHere = (cmdHandle_ != 0 || pendingConn_ != 0);
+        bool delegated  = handler_.positionShareWanted();
+        if (clientHere && !delegated) return;
+
+        AprsConfig& cfg = handler_.aprsConfig();
+
+        // "Partager ma position" (onglet Beacon de HTCommander) = bit
+        // shouldShareLocation du BSS, conservé en NVS. Décoché -> AUCUNE
+        // émission APRS, y compris en mode autonome (sans application).
+        if (!cfg.shouldShareLocation()) {
+            static uint32_t warnMs = 0;
+            if (millis() - warnMs > 120000UL) {
+                warnMs = millis();
+                Serial.println("[APRS] \"Partager ma position\" desactive (BSS) -> pas de balise");
+            }
+            return;
+        }
+
+        uint32_t now = millis();
+        uint32_t period = (uint32_t)cfg.intervalSec() * 1000UL;   // réglé dans HTCommander (BSS)
+        bool due = (lastBeaconMs_ != 0) && (now - lastBeaconMs_ >= period);
+#if APRS_BEACON_AT_BOOT
+        if (lastBeaconMs_ == 0 && now >= 30000) due = true;   // 1re balise ~30 s après boot
+#else
+        if (lastBeaconMs_ == 0) { lastBeaconMs_ = now; }      // démarre le compteur
+#endif
+        if (!due) return;
+        lastBeaconMs_ = now;
+
+        // Position : GPS si fix récent, sinon position fixe (réglée dans HTCommander).
+        double lat = cfg.lat(), lon = cfg.lon();
+        const char* src = "fixe";
+#if APRS_GPS_ENABLE
+        if (gps_.fix(lat, lon)) src = "GPS";
+#endif
+        // Toujours tenir la carte de HTCommander à jour, même sans indicatif.
+        handler_.emitPositionChanged(AprsConfig::degToRaw(lat), AprsConfig::degToRaw(lon));
+
+        // Indicatif non configuré -> pas d'émission RF (évite de baliser "NOCALL").
+        {
+            String c = cfg.callsign();
+            if (c.length() == 0 || c == "NOCALL" || c == "N0CALL") {
+                static uint32_t warnMs = 0;
+                if (millis() - warnMs > 60000UL) {
+                    warnMs = millis();
+                    Serial.println("[APRS] indicatif non configure -> balise RF desactivee "
+                                   "(regle APRS_CALLSIGN ou l'indicatif dans HTCommander)");
+                }
+                return;
+            }
+        }
+
+        // Identité + icône + message : lus du BSS (réglés dans HTCommander).
+        String call = cfg.callsign();
+        String msg  = cfg.beaconMessage();
+        String path = cfg.path();
+        aprs::BeaconParams bp;
+        bp.callsign = call.c_str();
+        bp.ssid     = cfg.ssid();
+        bp.path     = path.c_str();
+        bp.symTable = cfg.symbolTable();
+        bp.symCode  = cfg.symbolCode();
+        bp.comment  = msg.c_str();
+
+        uint8_t fr[300];
+        size_t n = aprs::buildPositionFrame(fr, sizeof(fr), bp, lat, lon);
+        if (!n) { Serial.println("[APRS] balise : trame trop longue, ignoree"); return; }
+
+        // Canal de balise (onglet Beacon de HTCommander, "auto_share_loc_ch") :
+        // 0 = canal courant ; sinon on cale le module RF sur le canal N-1 juste
+        // avant d'émettre, et on restaure ensuite (aprsBeaconChannelRestore).
+        uint8_t asc = handler_.aprsConfig().beaconChannel();
+        Serial.printf("[APRS] canal balise : %u (canal actif=%u)\n",
+                      asc, handler_.activeChannelId());
+        if (asc != 0 && beaconRestoreCh_ == 0xFF) {
+            uint8_t target = (uint8_t)(asc - 1);
+            if (target != handler_.activeChannelId() &&
+                handler_.syncRfToChannel(target)) {
+                beaconRestoreCh_ = handler_.activeChannelId();
+                beaconTxStartMs_ = millis();
+            }
+        }
+
+        uint16_t nn = (uint16_t)n;
+        xStreamBufferSend(tncTxQ_, &nn, sizeof(nn), 0);
+        xStreamBufferSend(tncTxQ_, fr,  nn,         0);
+        Serial.printf("[APRS] balise %s : %.5f, %.5f  (%s-%d '%c%c' -> %u o)\n",
+                      src, lat, lon, call.c_str(), cfg.ssid(),
+                      cfg.symbolTable(), cfg.symbolCode(), (unsigned)n);
+#endif
+    }
+
+    // Restaure le canal RF après une balise émise sur un autre canal.
+    void aprsBeaconChannelRestore() {
+#if APRS_BEACON_ENABLE
+        if (beaconRestoreCh_ == 0xFF) return;
+        uint32_t age = millis() - beaconTxStartMs_;
+        bool txDone  = (age > 4000) && !tnc_.transmitting() && !audio_.txToRadio()
+                       && !audio_.dataTxActive();
+        bool timeout = (age > 12000);
+        if (txDone || timeout) {
+            Serial.printf("[SA818] Balise : fin d'emission -> restauration du canal actif %u%s\n",
+                          handler_.activeChannelId(), timeout ? " (timeout)" : "");
+            handler_.syncRf();                 // retune sur le canal actif
+            beaconRestoreCh_ = 0xFF;
+        }
+#endif
     }
 
     // HT_SEND_DATA : [flags][ax25 fragment][chanId?]. On réassemble puis on

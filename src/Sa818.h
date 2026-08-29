@@ -86,7 +86,9 @@ public:
         snprintf(cmd, sizeof(cmd), "AT+SETFILTER=%d,%d,%d\r\n",
                  pre ? 0 : 1, high ? 0 : 1, low ? 0 : 1);
         flushRx();
-        return sendExpectOk(cmd, 500);
+        bool ok = sendExpectOk(cmd, 500);
+        Serial.printf("[SA818] SETFILTER %s%s", cmd, ok ? "" : "  -> ECHEC\n");
+        return ok;
     }
 
     // Renvoie 0..255, ou -1 si indisponible. Attention : monopolise l'UART

@@ -236,6 +236,45 @@ adaptateur serve aux deux projets.
 | **PD module RF** | **19** | `PIN_PD` | Alimentation du module SA818 (HIGH = allumé). `-1` si non câblé. Inutile en mode UV-K1. |
 | PTT local (option) | `-1` | `PIN_PHYS_PTT1/2` (5 / 33) | Force la capture ADC → HTCommander comme si le squelch était ouvert. |
 | LED d'état (option) | `-1` | `PIN_LED` (2) | Fixe en émission, clignote en réception. |
+| **GPS NMEA** (option) | **13** | — | RX de l'ESP ← TX du GPS, `Serial1` @ 9600. Utilisé **uniquement** si `APRS_GPS_ENABLE = true` (balise APRS « tracker »). Choisir un GPIO libre. |
+
+### Balise APRS autonome
+
+Quand la radio est sur le canal `APRS` **et qu'aucun HTCommander n'est
+connecté**, l'ESP construit lui-même une trame de position AX.25 (adresses +
+champ position ; le modem n'ajoute que préambule/bit-stuffing/FCS) et l'émet
+via le modem AFSK interne. Dès que HTCommander se connecte, il reprend la main
+(pas de doublon).
+
+**Réglable depuis HTCommander** (persisté en NVS, `src/AprsConfig.h`) :
+
+| Commande Benshi | Réglages |
+|---|---|
+| `READ`/`WRITE_BSS_SETTINGS` (33/34) | indicatif, SSID, icône, intervalle, message de balise, **ID station** (ident au relâché de PTT) |
+| `GET`/`SET_APRS_PATH` (72/71) | chemin de digipeaters |
+| `GET`/`SET_POSITION` (76/32) | position fixe |
+
+GPS ou fixe : la balise prend le fix GPS s'il est récent (`APRS_GPS_ENABLE`),
+sinon la position fixe (`SET_POSITION` / `APRS_FIXED_LAT`/`_LON`).
+
+Quand HTCommander active **Fichier > GPS**, il enregistre la notification
+`POSITION_CHANGE` et **délègue le balisage à la radio** : l'ESP balise alors
+même connecté, et pousse sa position (GPS ou fixe) à la carte de HTCommander.
+Sans « GPS » côté HTCommander, c'est lui qui balise et l'ESP se tait.
+
+La balise n'émet **que si « Partager ma position »** (onglet *Beacon* de
+HTCommander = bit `shouldShareLocation` du BSS) est coché. Ce réglage est
+conservé en NVS : en mode autonome, le dernier choix s'applique. Décoché =
+aucune émission APRS.
+
+> Par défaut `APRS_CALLSIGN` vaut `NOCALL` : la balise autonome **ne transmet
+> pas** tant que tu n'as pas mis ton indicatif (dans `config.h` ou via
+> HTCommander).
+
+Défauts (1re amorce NVS) : **section 7ter** de [`src/config.h`](src/config.h)
+— `APRS_CALLSIGN`, `APRS_SSID`, `APRS_DEST` (TOCALL, non réglable via
+HTCommander), `APRS_PATH`, `APRS_SYMBOL_TABLE`/`APRS_SYMBOL`, `APRS_COMMENT`,
+`APRS_BEACON_INTERVAL_MIN`, `APRS_FIXED_LAT`/`_LON`, `APRS_GPS_ENABLE`.
 
 Réglages : **section 5** de [`src/config.h`](src/config.h) (audio : `AUDIO_PTT_*`,
 `AUDIO_SQ_*`, `AUDIO_ADC_CHANNEL`, `AUDIO_SPK_VOLUME`, `AUDIO_MIC_GAIN`,

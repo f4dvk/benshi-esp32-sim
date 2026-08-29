@@ -72,7 +72,9 @@ public:
 #endif
     }
     void dataTxEnd() { /* le PTT retombe via la traîne dans ctlLoop */ }
-    bool dataTxActive() const { return (millis() - dataTxLastMs_.load()) < 300; }
+    bool dataTxActive() const {
+        return (millis() - dataTxLastMs_.load()) < (uint32_t)AUDIO_DATA_TX_HANG_MS;
+    }
 
     bool begin() {
 #if !AUDIO_BRIDGE_ENABLE
@@ -436,9 +438,11 @@ private:
                 }
             } else if (ioMode_ == IO_TX) {
                 size_t outN;
-                if (dataTxActive()) {
+                bool dataTx = dataTxActive();
+                if (dataTx) {
                     // Modulateur AFSK en cours (TNC TX) : débit natif (= débit
-                    // I2S), envoyé directement au DAC.
+                    // I2S), envoyé directement au DAC. Amplitude déjà réglée par
+                    // TNC_TX_GAIN dans le modulateur -> pas de AUDIO_SPK_VOLUME.
                     size_t br = xStreamBufferReceive(dataTxSb_, pcmOut,
                                                      kFrame * sizeof(int16_t), 0);
                     size_t got = br / sizeof(int16_t);
@@ -458,8 +462,9 @@ private:
                     outN = kFrame;
 #endif
                 }
+                float vol = dataTx ? 1.0f : (float)AUDIO_SPK_VOLUME;
                 for (size_t i = 0; i < outN; i++) {
-                    float in = pcmOut[i] * AUDIO_SPK_VOLUME;
+                    float in = pcmOut[i] * vol;
 #if AUDIO_DAC_LOWPASS
                     dacLp_ += (in - dacLp_) * (float)AUDIO_DAC_LP_ALPHA;   // adoucit l'escalier 8 bits
                     in = dacLp_;

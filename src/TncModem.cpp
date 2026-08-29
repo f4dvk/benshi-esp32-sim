@@ -27,13 +27,13 @@ void TncModem::demodTrampoline(const uint8_t* frame, size_t len) {
 void TncModem::modTrampoline(const float* s, size_t n) {
     TncModem* m = self_;
     if (!m || !m->txAudioCb_ || !n) return;
-    // float [-1..1] -> int16
+    // float [-1..1] -> int16, amplitude reglable (TNC_TX_GAIN, cf kv4p-ht)
     static int16_t buf[256];
     size_t i = 0;
     while (i < n) {
         size_t k = 0;
         for (; k < 256 && i < n; k++, i++) {
-            float v = s[i] * 30000.0f;
+            float v = s[i] * (TNC_TX_GAIN * 32767.0f);
             buf[k] = v > 32767.f ? 32767 : (v < -32768.f ? -32768 : (int16_t)v);
         }
         m->txAudioCb_(buf, k);
@@ -50,7 +50,7 @@ void TncModem::txAx25(const uint8_t* frame, size_t len) {
     float chunk[128];
     // La lib appelle modTrampoline au fil de la génération (callback bloquant
     // côté appelant -> cadençage temps réel via le DAC).
-    mod_->modulate(frame, len, chunk, 128, 250.0f /*lead ms*/, 60.0f /*tail ms*/);
+    mod_->modulate(frame, len, chunk, 128, TNC_TX_LEAD_MS, TNC_TX_TAIL_MS);
     txBusy_ = false;
     if (txDoneCb_) txDoneCb_();
 }

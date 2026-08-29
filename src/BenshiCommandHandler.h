@@ -3,6 +3,7 @@
 #include <atomic>
 #include "BenshiProtocol.h"
 #include "RadioState.h"
+#include "AprsConfig.h"
 #include "Sa818.h"
 #include "config.h"
 
@@ -32,9 +33,26 @@ public:
     // Corps brut de HT_SEND_DATA (fragment AX.25 : [flags][data][chanId?]).
     using DataTxFn = std::function<void(const uint8_t*, size_t)>;
 
-    void begin() { state_.begin(); }
+    void begin() { state_.begin(); aprs_.begin(); }
     void onNotify(NotifSink sink) { sink_ = std::move(sink); }
     void onDataTx(DataTxFn f)     { dataTxCb_ = std::move(f); }
+
+    // Réglages APRS (BSS / path / position), pilotables depuis HTCommander et
+    // lus par la balise autonome.
+    AprsConfig& aprsConfig() { return aprs_; }
+
+    // HTCommander a enregistré POSITION_CHANGE (File > GPS ou partage GPS série).
+    // La vraie VR-N76 délègue alors le balisage à la radio -> notre balise
+    // autonome doit tourner MÊME connectée, et pousser la position.
+    bool positionShareWanted() const {
+        return (registeredMask_ >> EventType::POSITION_CHANGE) & 1u;
+    }
+
+    // Pousse une notification POSITION_CHANGE (uniquement si enregistrée).
+    void emitPositionChanged(int32_t latRaw, int32_t lonRaw) {
+        emitEvent(EventType::POSITION_CHANGE,
+                  BenshiReplies::positionChangedEvent(latRaw, lonRaw));
+    }
 
     String  activeChannelName() { return state_.activeChannelName(); }
     uint8_t activeChannelId()   { return state_.activeChannelId(); }
@@ -91,6 +109,25 @@ public:
                       rf.tx_at_max_power ? "HAUTE" : "basse",
                       ok ? "OK" : "ECHEC (module hors bande ? pas de reponse ?)");
     }
+
+    // Cale TEMPORAIREMENT le module RF sur un autre canal mémoire (balise APRS
+    // sur un canal dédié). N'affecte pas l'état "canal actif" -> restaurer avec
+    // syncRf(). Sans effet en mode UV-K1. Renvoie true si le retune a eu lieu.
+    bool syncRfToChannel(uint8_t id) {
+        if (!rf_ || !rf_->present() || id >= CHANNEL_COUNT) return false;
+        RadioState::ActiveRf rf = RadioState::decodeRf(state_.channelStruct(id));
+        if (rf.tx_mhz < 1.0 || rf.rx_mhz < 1.0) return false;
+        int sql = state_.squelch(); if (sql > 8) sql = 8;
+        bool ok = rf_->tune(rf.rx_mhz, rf.tx_mhz, rf.rx_ctcss_hz, rf.tx_ctcss_hz, rf.wide, sql);
+        bool filt = !rf.emph_bypass;
+        rf_->setFilters(filt, filt, filt);
+        Serial.printf("[SA818] Balise : canal %u temporaire (TX %.4f MHz, %s) -> %s\n",
+                      id, rf.tx_mhz, rf.wide ? "25kHz" : "12.5kHz", ok ? "OK" : "ECHEC");
+        return ok;
+    }
+
+    // Canal de balise APRS réglé dans HTCommander (0 = canal courant).
+    uint8_t autoShareLocCh() const { return state_.autoShareLocCh(); }
 
     // Appelé périodiquement par le transport (boucle Arduino).
     void pollRf() {
@@ -149,20 +186,41 @@ public:
             outMsg.body = BenshiReplies::readStatus(statusType);
 
         } else if (in.command == REGISTER_NOTIFICATION) {
-            for (uint8_t t : in.body) {
-                if (t < 16) registeredMask_ |= (uint16_t)(1u << t);
-            }
+            // Corps = liste d'octets de type (HTCommander en groupe parfois
+            // plusieurs, précédés d'octets nuls) -> on traite tout.
+            for (uint8_t t : in.body) if (t > 0 && t < 16) registeredMask_ |= (uint16_t)(1u << t);
             Serial.printf("[CMD] REGISTER_NOTIFICATION : masque = 0x%04X\n", registeredMask_);
+            outMsg.body = BenshiReplies::registerNotifAck();
+
+        } else if (in.command == CANCEL_NOTIFICATION) {
+            for (uint8_t t : in.body) if (t > 0 && t < 16) registeredMask_ &= (uint16_t)~(1u << t);
+            Serial.printf("[CMD] CANCEL_NOTIFICATION : masque = 0x%04X\n", registeredMask_);
             outMsg.body = BenshiReplies::registerNotifAck();
 
         } else if (in.command == READ_SETTINGS) {
             outMsg.body = BenshiReplies::settings(state_);
 
         } else if (in.command == WRITE_SETTINGS) {
+            {
+                uint8_t b0 = in.body.empty() ? 0 : in.body[0];
+                uint8_t b5 = in.body.size() > 5 ? in.body[5] : 0;
+                uint8_t b11 = in.body.size() > 11 ? in.body[11] : 0;
+                Serial.printf("[STATE] WRITE_SETTINGS %u o : chA=%u chB=%u  b5=0x%02X b11=0x%02X"
+                              "  auto_share_loc_ch=%u  (canal actif courant=%u)\n",
+                              (unsigned)in.body.size(), (b0 >> 4) & 0x0F, b0 & 0x0F, b5, b11,
+                              (uint8_t)((b5 & 0x1F) | ((b11 & 0x07) << 5)),
+                              state_.activeChannelId());
+            }
             bool ok = state_.setSettingsStruct(in.body.data(), in.body.size());
             outMsg.body = BenshiReplies::writeSettingsAck(
                 ok ? ReplyStatus::SUCCESS : ReplyStatus::INVALID_PARAMETER);
-            if (ok) { htStatusDirty_ = true; rfDirty_.store(true); }   // VFO/canal -> retune
+            if (ok) {
+                htStatusDirty_ = true; rfDirty_.store(true);   // VFO/canal -> retune
+                // Canal de balise : conservé à part (AprsConfig), et ré-injecté
+                // dans la structure pour survivre aux réécritures de HTCommander.
+                aprs_.noteAutoShareLocCh(state_.autoShareLocCh());
+                state_.setAutoShareLocCh(aprs_.beaconChannel());
+            }
 
         } else if (in.command == READ_RF_CH) {
             uint8_t channelId = in.body.empty() ? 0 : in.body[0];
@@ -223,6 +281,51 @@ public:
         } else if (in.command == SET_PHONE_STATUS) {
             outMsg.body = BenshiReplies::phoneStatusAck();
 
+        } else if (in.command == READ_BSS_SETTINGS) {
+            outMsg.body.assign(1, ReplyStatus::SUCCESS);
+            outMsg.body.insert(outMsg.body.end(), aprs_.bss(),
+                               aprs_.bss() + AprsConfig::BSS_LEN);
+            Serial.printf("[APRS] READ_BSS_SETTINGS -> %u o (%s-%d)\n",
+                          (unsigned)outMsg.body.size(),
+                          aprs_.callsign().c_str(), aprs_.ssid());
+
+        } else if (in.command == WRITE_BSS_SETTINGS) {
+            Serial.printf("[APRS] WRITE_BSS_SETTINGS : %u o recus\n", (unsigned)in.body.size());
+            aprs_.noteBssWrite();   // le WRITE_SETTINGS qui suit porte auto_share_loc_ch
+            int r = aprs_.setBss(in.body.data(), in.body.size());
+            outMsg.body = { r >= 0 ? ReplyStatus::SUCCESS : ReplyStatus::INVALID_PARAMETER };
+            if (r == 1) bssDirty_ = true;   // notifie HTCommander uniquement si ça a changé
+            else if (r < 0) Serial.println("[APRS]   -> REFUSE (taille < 46 ?)");
+
+        } else if (in.command == GET_APRS_PATH) {
+            outMsg.body.assign(1, ReplyStatus::SUCCESS);
+            const String& p = aprs_.path();
+            outMsg.body.insert(outMsg.body.end(), p.c_str(), p.c_str() + p.length());
+            Serial.printf("[APRS] GET_APRS_PATH -> \"%s\"\n", p.c_str());
+
+        } else if (in.command == SET_APRS_PATH) {
+            char buf[64] = {0};
+            size_t n = in.body.size() < sizeof(buf) - 1 ? in.body.size() : sizeof(buf) - 1;
+            memcpy(buf, in.body.data(), n);
+            Serial.printf("[APRS] SET_APRS_PATH : \"%s\"\n", buf);
+            aprs_.setPath(String(buf));
+            outMsg.body = { ReplyStatus::SUCCESS };
+
+        } else if (in.command == SET_POSITION) {
+            if (in.body.size() >= 6) {
+                int32_t la = signExtend24((in.body[0] << 16) | (in.body[1] << 8) | in.body[2]);
+                int32_t lo = signExtend24((in.body[3] << 16) | (in.body[4] << 8) | in.body[5]);
+                Serial.printf("[APRS] SET_POSITION : %.5f, %.5f\n", la / 30000.0, lo / 30000.0);
+                aprs_.setPositionRaw(la, lo);
+                outMsg.body = { ReplyStatus::SUCCESS };
+            } else {
+                outMsg.body = { ReplyStatus::INVALID_PARAMETER };
+            }
+
+        } else if (in.command == GET_POSITION) {
+            outMsg.body = BenshiReplies::position(aprs_.latRaw(), aprs_.lonRaw());
+            Serial.printf("[APRS] GET_POSITION -> %.5f, %.5f\n", aprs_.lat(), aprs_.lon());
+
         } else {
             Serial.printf("[CMD] Commande non gérée: group=%u cmd=%u\n",
                           in.command_group, in.command);
@@ -237,6 +340,14 @@ public:
         if (htStatusDirty_) {
             htStatusDirty_ = false;
             emitHtStatusChanged();
+        }
+        if (bssDirty_) {
+            bssDirty_ = false;
+            // HTCommander NE relit PAS le BSS après une écriture : il ne se
+            // rafraîchit QUE sur cette notification, et il ne s'y abonne pas
+            // explicitement -> on l'émet toujours (comme la vraie VR-N76).
+            emitEvent(EventType::BSS_SETTINGS_CHANGED, BenshiReplies::bssChangedEvent(),
+                      /*force=*/true);
         }
     }
 
@@ -279,14 +390,34 @@ public:
         sink_(m);
     }
 
+    // Émet une EVENT_NOTIFICATION. Par défaut seulement si le type est
+    // enregistré ; `force` l'émet dans tous les cas.
+    void emitEvent(uint8_t type, std::vector<uint8_t> body, bool force = false) {
+        if (!sink_) return;
+        if (!force && type < 16 && !(registeredMask_ & (1u << type))) return;
+        BenshiMessage m;
+        m.command_group = CommandGroup::BASIC;
+        m.is_reply      = false;
+        m.command       = BasicCommand::EVENT_NOTIFICATION;
+        m.body          = std::move(body);
+        sink_(m);
+    }
+
+    static int32_t signExtend24(int32_t v) {
+        v &= 0x00FFFFFF;
+        return (v & 0x00800000) ? (v - 0x01000000) : v;
+    }
+
 private:
     RadioState state_;
+    AprsConfig aprs_;
     NotifSink  sink_;
     DataTxFn   dataTxCb_;
     Sa818*     rf_ = nullptr;
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré
     bool     htStatusDirty_  = false;
+    bool     bssDirty_       = false;
     std::atomic<bool> rfDirty_{false};   // canal actif changé -> retune module RF
 
     std::atomic<bool>    sqOpen_{false};

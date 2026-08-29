@@ -109,9 +109,12 @@ public:
         settings_ = std::move(v);
         persistBlob("settings", settings_, "Reglages", 0, String());
         Serial.printf("[STATE]   -> VFO-A=%u VFO-B=%u dual=%u squelch=%u scan=%u "
-                      "canal actif=%u\n",
+                      "canal actif=%u  auto_share_loc_ch=%u (recu %u o)\n",
                       channelA(), channelB(), doubleChannel(), squelch(),
-                      scan() ? 1 : 0, activeChannelId());
+                      scan() ? 1 : 0, activeChannelId(), autoShareLocCh(), (unsigned)len);
+        Serial.print("[STATE]   settings hex :");
+        for (size_t i = 0; i < settings_.size(); i++) Serial.printf(" %02X", settings_[i]);
+        Serial.println();
         return true;
     }
 
@@ -125,6 +128,21 @@ public:
     uint8_t squelch()       const { return settings_[1] & 0x0F; }
     uint8_t micGain()       const { return (settings_[2] & 0x0E) >> 1; }
     bool    scan()          const { return (settings_[1] & 0x80) != 0; }
+
+    // Canal de balise APRS ("auto_share_loc_ch", onglet Beacon de HTCommander) :
+    // 8 bits répartis sur 2 octets. 0 = "canal courant", N = canal mémoire N-1.
+    uint8_t autoShareLocCh() const {
+        if (settings_.size() < 12) return 0;
+        return (uint8_t)((settings_[5] & 0x1F) | ((settings_[11] & 0x07) << 5));
+    }
+    // Ré-injecte la valeur dans la structure (HTCommander la perd lors de ses
+    // réécritures de réconciliation) -> les prochains READ_SETTINGS la portent.
+    void setAutoShareLocCh(uint8_t ch) {
+        if (settings_.size() < 12 || autoShareLocCh() == ch) return;
+        settings_[5]  = (uint8_t)((settings_[5]  & 0xE0) | (ch & 0x1F));
+        settings_[11] = (uint8_t)((settings_[11] & 0xF8) | ((ch >> 5) & 0x07));
+        if (nvsOk_) prefs_.putBytes("settings", settings_.data(), settings_.size());
+    }
 
     // Canal actuellement "actif" -> renvoye par GET_HT_STATUS.
     uint8_t activeChannelId() const {

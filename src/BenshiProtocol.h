@@ -22,6 +22,7 @@ namespace BasicCommand {
     static const uint16_t GET_DEV_INFO           = 4;
     static const uint16_t READ_STATUS            = 5;
     static const uint16_t REGISTER_NOTIFICATION   = 6;
+    static const uint16_t CANCEL_NOTIFICATION     = 7;
     static const uint16_t EVENT_NOTIFICATION      = 9;
     static const uint16_t READ_SETTINGS           = 10;
     static const uint16_t WRITE_SETTINGS          = 11;
@@ -31,12 +32,15 @@ namespace BasicCommand {
     static const uint16_t GET_VOLUME              = 22;
     static const uint16_t SET_VOLUME              = 23;
     static const uint16_t HT_SEND_DATA            = 31;
-    static const uint16_t RX_DATA                 = 57;
+    static const uint16_t SET_POSITION            = 32;
     static const uint16_t READ_BSS_SETTINGS       = 33;
     static const uint16_t WRITE_BSS_SETTINGS      = 34;
     static const uint16_t SET_PHONE_STATUS        = 51;
+    static const uint16_t RX_DATA                 = 57;
     static const uint16_t WRITE_REGION_NAME       = 59;
     static const uint16_t SET_REGION              = 60;
+    static const uint16_t SET_APRS_PATH           = 71;
+    static const uint16_t GET_APRS_PATH           = 72;
     static const uint16_t READ_REGION_NAME        = 73;
     static const uint16_t GET_POSITION            = 76;
 }
@@ -49,10 +53,12 @@ namespace ReplyStatus {
 }
 
 namespace EventType {
-    static const uint8_t HT_STATUS_CHANGED   = 1;
-    static const uint8_t DATA_RXD            = 2;
-    static const uint8_t HT_CH_CHANGED       = 5;
-    static const uint8_t HT_SETTINGS_CHANGED = 6;
+    static const uint8_t HT_STATUS_CHANGED    = 1;
+    static const uint8_t DATA_RXD             = 2;
+    static const uint8_t HT_CH_CHANGED        = 5;
+    static const uint8_t HT_SETTINGS_CHANGED  = 6;
+    static const uint8_t BSS_SETTINGS_CHANGED = 11;
+    static const uint8_t POSITION_CHANGE      = 13;
 }
 
 struct BenshiMessage {
@@ -284,6 +290,40 @@ namespace BenshiReplies {
     // ---- REGISTER_NOTIFICATION (accusé) --------------------------------
     inline std::vector<uint8_t> registerNotifAck() {
         return { ReplyStatus::SUCCESS };
+    }
+
+    // ---- GET_POSITION : [status][lat 3o BE][lon 3o BE][alt 2o][speed 2o]
+    //      [heading 2o][time 4o BE][accuracy 2o]  (RadioPosition.fromBytes)
+    //      lat/lon = degrés * 30000, complément à 2 sur 24 bits.
+    inline std::vector<uint8_t> position(int32_t latRaw, int32_t lonRaw) {
+        auto u24 = (uint32_t)latRaw & 0x00FFFFFF;
+        auto v24 = (uint32_t)lonRaw & 0x00FFFFFF;
+        uint32_t t = (uint32_t)(millis() / 1000);
+        return {
+            ReplyStatus::SUCCESS,
+            (uint8_t)(u24 >> 16), (uint8_t)(u24 >> 8), (uint8_t)u24,
+            (uint8_t)(v24 >> 16), (uint8_t)(v24 >> 8), (uint8_t)v24,
+            0, 0,                                   // altitude
+            0, 0,                                   // vitesse
+            0, 0,                                   // cap
+            (uint8_t)(t >> 24), (uint8_t)(t >> 16), (uint8_t)(t >> 8), (uint8_t)t,
+            0, 0                                    // précision
+        };
+    }
+
+    // ---- EVENT_NOTIFICATION / BSS_SETTINGS_CHANGED : [type=11]
+    //      (HTCommander relit alors READ_BSS_SETTINGS).
+    inline std::vector<uint8_t> bssChangedEvent() {
+        return { EventType::BSS_SETTINGS_CHANGED };
+    }
+
+    // ---- EVENT_NOTIFICATION / POSITION_CHANGE : [type=13][18 o de position]
+    //      Même corps que GET_POSITION mais octet 0 = type au lieu du statut
+    //      (RadioPosition.fromBytes force ensuite le statut à 0).
+    inline std::vector<uint8_t> positionChangedEvent(int32_t latRaw, int32_t lonRaw) {
+        std::vector<uint8_t> b = position(latRaw, lonRaw);
+        b[0] = EventType::POSITION_CHANGE;
+        return b;
     }
 
     // ---- READ_REGION_NAME ----------------------------------------------

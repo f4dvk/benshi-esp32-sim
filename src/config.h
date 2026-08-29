@@ -271,7 +271,11 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //     kv4p-ht : PIN_PTT = 18, ACTIF À L'ÉTAT BAS (LOW = émission).
 #define AUDIO_PTT_GPIO         18       // -1 = pas de commande PTT
 #define AUDIO_PTT_ACTIVE_LOW   true
-#define AUDIO_PTT_TAIL_MS      250
+#define AUDIO_PTT_TAIL_MS      250      // traîne PTT en PHONIE (flux SBC), pas en TNC
+// Traîne PTT en émission DONNÉES (TNC/AFSK) : temps de maintien du PTT après le
+// dernier échantillon du modulateur. Évite les coupures si le flux a un trou ;
+// une fois la trame finie, c'est du PTT maintenu pour rien -> garder court.
+#define AUDIO_DATA_TX_HANG_MS  40
 
 // --- Squelch : ENTRÉE indiquant que le poste reçoit un signal (squelch
 //     ouvert). Sert à démarrer la capture ADC -> HTCommander et à renseigner
@@ -391,6 +395,84 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // d'un coup ; le faire pendant l'établissement de la 2e liaison RFCOMM affame
 // L2CAP -> HTCommander décroche. On attend donc que la connexion soit stable.
 #define TNC_START_DELAY_MS    3000
+
+// --- Émission AFSK : temporisation d'accrochage (≈ "TXDelay") --------------
+// Silence de porteuse AVANT le préambule : laisse au module RF le temps de
+// vraiment passer en émission, et au récepteur le temps de caler son AGC/PLL.
+// Un SA818/Quansheng met ~200-400 ms à monter -> une valeur trop faible fait
+// perdre le début de la trame et RIEN n'est décodé.
+// kv4p-ht utilise 1100 ms (lead) / 700 ms (tail).
+// TNC_TX_TAIL_MS = silence de porteuse APRÈS les fanions de fermeture : juste
+// le temps que le dernier bit sorte du module. 80-150 ms suffisent ; au-delà
+// c'est du PTT maintenu pour rien. (Le pont ajoute encore AUDIO_DATA_TX_HANG_MS
+// avant de relâcher le PTT.)
+#define TNC_TX_LEAD_MS        1000.0f
+#define TNC_TX_TAIL_MS          60.0f
+// Amplitude de l'audio AFSK envoyé au DAC (0..1). 0.8 = comme kv4p-ht
+// (TX_AFSK_GAIN). Baisser si sur-déviation (son "cassé" / splatter), monter si
+// sous-déviation (trame trop faible). Dépend AUSSI de l'atténuateur matériel
+// entre GPIO25 et l'entrée micro du module (voir README).
+#define TNC_TX_GAIN           0.8f
+
+// ----------------------------------------------------------------------
+// 7ter) Balise APRS autonome (générée par l'ESP)
+// ----------------------------------------------------------------------
+// Quand la radio est sur le canal TNC_CHANNEL_NAME ("APRS") et qu'AUCUN
+// HTCommander n'est connecté, l'ESP construit lui-même une trame de position
+// APRS (AX.25 UI) et l'émet via le modem AFSK interne -> PTT -> module RF.
+// Dès que HTCommander se connecte, c'est LUI qui gère les balises et l'ESP se
+// tait -> pas de doublon.
+//
+// CONDITION : la balise n'émet QUE si "Partager ma position" (onglet Beacon de
+// HTCommander = bit shouldShareLocation du BSS) est coché. Ce réglage est
+// conservé en NVS -> en mode autonome, le dernier choix fait foi. Décoché =
+// aucune émission APRS.
+//
+// CANAL : le réglage "Canal" de l'onglet Beacon (auto_share_loc_ch, dans la
+// structure Settings) est pris en compte en MODE SA818 : "canal courant" =
+// émission sur le canal actif ; un canal mémoire = le module est calé dessus
+// juste avant la trame, puis le canal précédent est restauré. En mode UV-K1
+// (poste externe), la balise part sur la fréquence où le poste est réglé.
+//
+// C'est bien l'ESP qui génère la trame (adresses AX.25 + champ position) ; le
+// modem n'ajoute que préambule + bit-stuffing + FCS.
+//
+// LES VALEURS CI-DESSOUS NE SONT QUE LES DÉFAUTS (1re amorce en NVS). Ensuite,
+// HTCommander lit et écrit ces réglages via son protocole :
+//   READ/WRITE_BSS_SETTINGS  -> indicatif, SSID, icône, intervalle, message,
+//                               ID station (ident au relâché de PTT)
+//   GET/SET_APRS_PATH        -> chemin de digipeaters
+//   GET/SET_POSITION         -> position fixe
+// Ce que tu règles dans HTCommander est persisté (NVS namespace "aprs") et
+// utilisé par la balise autonome. Voir src/AprsConfig.h.
+// GPS ou fixe : la balise prend le fix GPS s'il est récent (APRS_GPS_ENABLE),
+// sinon la position fixe réglée dans HTCommander (ou APRS_FIXED_LAT/LON).
+#define APRS_BEACON_ENABLE        true
+// Indicatif, 1..6 caractères. "NOCALL" = non configuré -> la balise autonome
+// NE TRANSMET PAS tant que tu n'as pas mis ton indicatif (ici ou via HTCommander).
+#define APRS_CALLSIGN             "NOCALL"
+#define APRS_SSID                 7                  // 0..15 (7 = station fixe, 9 = mobile)
+#define APRS_DEST                 "APZ001"           // TOCALL (APZxxx = expérimental) — non réglable via HTCommander
+#define APRS_PATH                 "WIDE1-1,WIDE2-1"  // digis séparés par des virgules, "" = direct
+#define APRS_SYMBOL_TABLE         '/'                // '/' primaire, '\\' alternative
+#define APRS_SYMBOL               '-'                // icône : '-' maison, '>' voiture, '[' piéton, 'Y' voilier...
+#define APRS_COMMENT              "Benshi ESP32 APRS" // message de balise (18 car. max côté BSS)
+#define APRS_BEACON_INTERVAL_MIN  10                 // minutes entre deux balises (défaut si BSS = 0)
+#define APRS_BEACON_AT_BOOT       true               // 1 balise ~30 s après le démarrage
+
+// Position FIXE par défaut. Degrés décimaux : négatif = Sud / Ouest.
+#define APRS_FIXED_LAT            47.218370
+#define APRS_FIXED_LON            -1.552800
+#define APRS_FIXED_ALT_M         (-1)                // altitude en m dans le commentaire ; -1 = ne pas inclure
+
+// GPS NMEA optionnel -> balise "tracker" (position dynamique). Repli sur la
+// position fixe tant qu'il n'y a pas de fix valide (< APRS_GPS_FIX_MAX_AGE_S).
+// Serial1 sur des GPIO LIBRES (pas ceux de kv4p-ht) : par défaut RX=GPIO13.
+#define APRS_GPS_ENABLE           false
+#define APRS_GPS_RX_GPIO          13                 // RX de l'ESP  <- TX du GPS
+#define APRS_GPS_TX_GPIO         (-1)                // inutile (on n'écrit pas vers le GPS)
+#define APRS_GPS_BAUD             9600
+#define APRS_GPS_FIX_MAX_AGE_S    30                 // au-delà, on considère le fix perdu
 
 // ----------------------------------------------------------------------
 // 7) Traces de mise au point
