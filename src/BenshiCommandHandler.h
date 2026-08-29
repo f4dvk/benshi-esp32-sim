@@ -64,8 +64,15 @@ public:
                           state_.activeChannelId(), rf.tx_mhz, rf.rx_mhz);
             return;
         }
+        // Niveau de squelch envoyé au module = celui réglé dans HTCommander
+        // (WRITE_SETTINGS -> RadioState), borné 0..8 pour le SA818. 0 = squelch
+        // ouvert (audio permanent, utile APRS/TNC). RF_MODULE_SQUELCH ne sert
+        // plus qu'au choix COMPILE-TIME de la stratégie de capture (voir
+        // AudioBridge : #if RF_MODULE_SQUELCH == 0).
+        int sql = state_.squelch();
+        if (sql > 8) sql = 8;
         bool ok = rf_->tune(rf.rx_mhz, rf.tx_mhz, rf.rx_ctcss_hz, rf.tx_ctcss_hz,
-                            rf.wide, RF_MODULE_SQUELCH);
+                            rf.wide, sql);
         // Filtres SA818 (pré/dé-emphase + HP + BP) : on suit STRICTEMENT le bit
         // pre_de_emph_bypass du canal actif, y compris sur le canal données
         // (APRS). Pour tester l'AFSK avec l'audio plat, mettre emph_bypass=true
@@ -77,10 +84,10 @@ public:
         digitalWrite(RF_MODULE_HL_GPIO, rf.tx_at_max_power ? LOW : HIGH);
 #endif
         Serial.printf("[SA818] Retune canal %u : RX %.4f / TX %.4f MHz, %s, CTCSS %.1f/%.1f, "
-                      "filtres %s, puissance %s -> %s\n",
+                      "squelch %d, filtres %s, puissance %s -> %s\n",
                       state_.activeChannelId(), rf.rx_mhz, rf.tx_mhz,
                       rf.wide ? "25kHz" : "12.5kHz", rf.rx_ctcss_hz, rf.tx_ctcss_hz,
-                      filt ? "ON" : "PLAT (bypass)",
+                      sql, filt ? "ON" : "PLAT (bypass)",
                       rf.tx_at_max_power ? "HAUTE" : "basse",
                       ok ? "OK" : "ECHEC (module hors bande ? pas de reponse ?)");
     }
