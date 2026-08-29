@@ -503,6 +503,12 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define NEXTION_BAUD             115200 // débit UART ; l'écran doit être réglé pareil (bauds=)
 #define NEXTION_GPS_SOFT_RX_GPIO 22     // GPS sur SoftwareSerial quand le Nextion est actif
 #define NEXTION_SPECTRUM_MS      150    // cadence d'envoi du spectre (waveform)
+// Composant Waveform "sSpec" de l'interface .HMI (voir nextion/). L'ID est
+// attribué par le Nextion Editor selon l'ordre de création : à relever dans
+// l'éditeur (panneau d'attributs -> id) et à reporter ici.
+#define NEXTION_WAVE_ID          10     // .id du composant sSpec
+#define NEXTION_WAVE_W           272    // largeur de sSpec en pixels (= nb de points envoyés)
+#define NEXTION_WAVE_H           64     // hauteur de sSpec en pixels
 
 #define DISPLAY_I2C_SDA           21
 #define DISPLAY_I2C_SCL           22

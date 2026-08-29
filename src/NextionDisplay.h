@@ -24,14 +24,15 @@
 // Les couleurs .pco sont en RGB565.
 // ============================================================================
 
+// NEXTION_WAVE_ID / _W / _H viennent de config.h (repli si absents).
 #ifndef NEXTION_WAVE_ID
-#define NEXTION_WAVE_ID 2       // .id du composant Waveform (visible dans l'éditeur)
+#define NEXTION_WAVE_ID 10
 #endif
 #ifndef NEXTION_WAVE_W
-#define NEXTION_WAVE_W  240     // largeur du composant Waveform (px)
+#define NEXTION_WAVE_W  272
 #endif
 #ifndef NEXTION_WAVE_H
-#define NEXTION_WAVE_H  120     // hauteur du composant Waveform (px)
+#define NEXTION_WAVE_H  64
 #endif
 
 class NextionDisplay {

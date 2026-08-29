@@ -266,8 +266,8 @@ le Nextion prend **`Serial1`** et le GPS passe alors sur un **UART logiciel**
 
 `NEXTION_BAUD` = 115200 (le firmware tente de passer un écran neuf de 9600 à
 115200 au démarrage, `bauds=`). L'**interface `.HMI`** est à créer dans le
-**Nextion Editor** et à flasher séparément (carte SD ou upload série). `page0`
-doit contenir :
+**Nextion Editor** et à flasher séparément (carte SD ou upload série) — plan
+complet + maquette dans **[`nextion/`](nextion/)**. `page0` doit contenir :
 
 | Objet | Type | Contenu poussé par l'ESP |
 |---|---|---|
