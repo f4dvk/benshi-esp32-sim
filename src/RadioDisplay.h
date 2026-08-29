@@ -42,10 +42,22 @@ public:
     void setPcmSource(PcmSource fn) { pcm_ = std::move(fn); }
 
     bool begin() {
+        uint32_t freeHeap = ESP.getFreeHeap();
+        if (freeHeap < 30000) {
+            Serial.printf("[DISP] tas trop juste (%u o) -> ecran non demarre\n", (unsigned)freeHeap);
+            return false;
+        }
         mtx_ = xSemaphoreCreateMutex();
         Wire.begin(DISPLAY_I2C_SDA, DISPLAY_I2C_SCL, DISPLAY_I2C_FREQ);
+        // En SPI matériel, seules les lignes de contrôle passent par l'I2C
+        // (1 octet) : le gros tampon n'est utile qu'en bit-bang.
+#if ILI9225_HW_SPI
+        size_t wb = Wire.setBufferSize(128);
+#else
         size_t wb = Wire.setBufferSize(Mcp23017::kWireBuf + 8);
-        Serial.printf("[DISP] tampon I2C = %u o\n", (unsigned)wb);
+#endif
+        Serial.printf("[DISP] tampon I2C = %u o, tas libre %u o\n",
+                      (unsigned)wb, (unsigned)freeHeap);
         if (!mcp_.begin(Wire, MCP23017_ADDR, wb)) {
             Serial.printf("[DISP] MCP23017 absent (0x%02X) -> ecran desactive\n", MCP23017_ADDR);
             return false;
@@ -53,7 +65,7 @@ public:
         Serial.printf("[DISP] MCP23017 OK  IOCON=0x%02X IODIRA=0x%02X\n",
                       mcp_.readReg(Mcp23017::REG_IOCON), mcp_.readReg(Mcp23017::REG_IODIRA));
         tft_.begin(mcp_);
-        xTaskCreatePinnedToCore(&RadioDisplay::trampoline, "display", 4608, this, 1, nullptr, 1);
+        xTaskCreatePinnedToCore(&RadioDisplay::trampoline, "display", 4096, this, 1, nullptr, 1);
         return true;
     }
 
@@ -127,6 +139,7 @@ private:
     static const int SPX = 3, SPY = 112, SPW = 214, SPH = 26;   // cadre
     static const int SP_PX = SPX + 2, SP_PY = SPY + 2;          // zone de tracé
     static const int SP_PW = SPW - 4, SP_PH = SPH - 4;          // 210 x 22
+    static const int SP_STRIP = 6;                              // hauteur de bande (blit)
     static const int SP_BARS = 24, SP_MAXBIN = 24;   // 24 points -> ~3 kHz @ 32 kHz
     static const uint32_t SPEC_IDLE_CLEAR_MS = 2500; // efface le spectre N ms après la perte du signal
     static const int SEP3  = 141;
@@ -156,19 +169,19 @@ private:
 
     // Trace un chiffre matrice en UNE fenêtre GRAM (via Ili9225::blit) : ~30x
     // plus rapide que N petits fillRect. L'appelant ne le fait que si le chiffre
-    // a changé (comparaison avec dgPrev_).
+    // a changé (comparaison avec dgPrev_). Utilise le tampon partagé scratch_.
     void digMat(int x, int y, int cell, int sq, const uint8_t* want, uint16_t on) {
         const int w = DM_COLS * cell, h = DM_ROWS * cell;
-        for (int i = 0; i < w * h; i++) digbuf_[i] = BG;
+        for (int i = 0; i < w * h; i++) scratch_[i] = BG;
         for (int r = 0; r < DM_ROWS; r++)
             for (int c = 0; c < DM_COLS; c++) {
                 if (!((want[r] >> (DM_COLS - 1 - c)) & 1)) continue;
                 for (int yy = 0; yy < sq; yy++) {
-                    uint16_t* row = &digbuf_[(r * cell + yy) * w + c * cell];
+                    uint16_t* row = &scratch_[(r * cell + yy) * w + c * cell];
                     for (int xx = 0; xx < sq; xx++) row[xx] = on;
                 }
             }
-        tft_.blit(x, y, w, h, digbuf_);
+        tft_.blit(x, y, w, h, scratch_);
     }
 
     // Échelle S-mètre façon Icom : S1..S9 en gris, +20/+40/+60 en rouge.
@@ -335,51 +348,51 @@ private:
         } else {
             if (!specIdleMs_) specIdleMs_ = millis();
             bool hard = millis() - specIdleMs_ > SPEC_IDLE_CLEAR_MS;
-            bool any = false;
-            for (int b = 0; b < SP_BARS; b++) {
-                if (specVal_[b]) any = true;
+            for (int b = 0; b < SP_BARS; b++)
                 specVal_[b] = (hard || specVal_[b] <= 30) ? 0 : (uint8_t)(specVal_[b] - 30);
-            }
-            if (!any) {
-                if (specDrawn_) { memset(specLineBuf_, 0, sizeof(specLineBuf_));
-                                  tft_.blit(SP_PX, SP_PY, SP_PW, SP_PH, specLineBuf_);
-                                  specDrawn_ = false; }
-                return;
-            }
         }
 
-        memset(specLineBuf_, 0, sizeof(specLineBuf_));
+        bool empty = true;
         int px[SP_BARS], py[SP_BARS];
         for (int b = 0; b < SP_BARS; b++) {
+            if (specVal_[b]) empty = false;
             px[b] = (SP_BARS > 1) ? b * (SP_PW - 1) / (SP_BARS - 1) : 0;
             py[b] = (SP_PH - 1) - (int)specVal_[b] * (SP_PH - 1) / 255;
         }
-        for (int b = 0; b + 1 < SP_BARS; b++)
-            plotSeg(px[b], py[b], px[b + 1], py[b + 1]);
-        tft_.blit(SP_PX, SP_PY, SP_PW, SP_PH, specLineBuf_);
-        specDrawn_ = true;
+        if (empty && !specDrawn_) return;   // déjà vide, rien à faire
+
+        // Tracé + envoi par bandes horizontales (tampon partagé scratch_ ->
+        // ~9 Ko de RAM statique économisés vs un tampon plein écran).
+        for (int y0 = 0; y0 < SP_PH; y0 += SP_STRIP) {
+            int sh = (y0 + SP_STRIP <= SP_PH) ? SP_STRIP : (SP_PH - y0);
+            memset(scratch_, 0, (size_t)SP_PW * sh * sizeof(uint16_t));
+            for (int b = 0; b + 1 < SP_BARS; b++)
+                plotSeg(px[b], py[b], px[b + 1], py[b + 1], y0, sh);
+            tft_.blit(SP_PX, SP_PY + y0, SP_PW, sh, scratch_);
+        }
+        specDrawn_ = !empty;
     }
 
     static uint16_t specColor(int y) {          // y : 0 = haut du tracé
         int pc = (SP_PH - 1 - y) * 100 / (SP_PH - 1);
         return pc > 75 ? REDX : (pc > 45 ? AMBER : MTRG);
     }
-    void specPix(int x, int y, uint16_t c) {
-        if (x >= 0 && x < SP_PW && y >= 0 && y < SP_PH) specLineBuf_[y * SP_PW + x] = c;
-    }
-    void plotSeg(int x0, int y0, int x1, int y1) {   // Bresenham, trait 2 px
+    void plotSeg(int x0, int y0, int x1, int y1, int sy0, int sh) {   // Bresenham, trait 2 px
         int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-        int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-        int err = dx + dy;
+        int dyy = -abs(y1 - y0), sdy = y0 < y1 ? 1 : -1;
+        int err = dx + dyy;
         for (;;) {
             uint16_t c = specColor(y0);
-            specPix(x0, y0, c);
-            specPix(x0, y0 + 1, c);
+            putScratch(x0, y0 - sy0, sh, c);
+            putScratch(x0, y0 + 1 - sy0, sh, c);
             if (x0 == x1 && y0 == y1) break;
             int e2 = 2 * err;
-            if (e2 >= dy) { err += dy; x0 += sx; }
-            if (e2 <= dx) { err += dx; y0 += sy; }
+            if (e2 >= dyy) { err += dyy; x0 += sx; }
+            if (e2 <= dx)  { err += dx;  y0 += sdy; }
         }
+    }
+    void putScratch(int x, int ly, int sh, uint16_t c) {
+        if (x >= 0 && x < SP_PW && ly >= 0 && ly < sh) scratch_[ly * SP_PW + x] = c;
     }
 #endif
 
@@ -389,13 +402,17 @@ private:
     RadioFace pending_, c_;
     bool     first_ = true;
     uint8_t  dgPrev_[7][DM_ROWS] = {{0}};   // état matrice de chaque chiffre
-    uint16_t digbuf_[(DM_COLS * DM_BIG) * (DM_ROWS * DM_BIG)];   // tampon d'un chiffre
+    // Tampon de tracé partagé : un chiffre (25x45) OU une bande de spectre
+    // (SP_PW x SP_STRIP). Dimensionné pour le plus grand des deux.
+    static const int DIG_AREA = (DM_COLS * DM_BIG) * (DM_ROWS * DM_BIG);
+    static const int STRIP_AREA = SP_PW * SP_STRIP;
+    static const int SCRATCH_N = DIG_AREA > STRIP_AREA ? DIG_AREA : STRIP_AREA;
+    uint16_t scratch_[SCRATCH_N];
     PcmSource pcm_;
 #if DISPLAY_SPECTRUM
     AudioSpectrum<SP_N> spectrum_;
     int16_t  specPcm_[SP_N];
     uint8_t  specVal_[SP_BARS] = {0};
-    uint16_t specLineBuf_[SP_PW * SP_PH];
     bool     specDrawn_ = false;
     uint32_t specDbgMs_ = 0;
     uint32_t specIdleMs_ = 0;

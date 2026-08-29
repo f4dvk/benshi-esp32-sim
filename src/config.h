@@ -522,6 +522,10 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define DISPLAY_REFRESH_MS       130                 // cadence de la tâche d'affichage (ne redessine QUE ce qui change)
 #define DISPLAY_SPECTRUM         true                // analyseur de spectre de l'audio reçu (FFT 256 pts)
 #define DISPLAY_SPECTRUM_MS      130                 // cadence de rafraîchissement du spectre
+// L'écran démarre APRÈS le Bluetooth : l'init I2C + le trafic de la tâche
+// d'affichage ne doivent pas concurrencer la publication du service SDP
+// (sinon HTCommander ne voit pas la radio et l'appairage traîne).
+#define DISPLAY_START_DELAY_MS   6000
 
 // ----------------------------------------------------------------------
 // 7) Traces de mise au point

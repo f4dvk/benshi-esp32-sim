@@ -182,10 +182,12 @@ public:
 
 #if DISPLAY_ENABLE
         // 9) Ecran de facade (ILI9225 / MCP23017).
+        // Demarrage DIFFERE (voir poll()) : l'init I2C + le trafic de la tache
+        // d'affichage ne doivent pas concurrencer la publication du service SDP
+        // pendant l'appairage.
 #if DISPLAY_SPECTRUM
         display_.setPcmSource([this](int16_t* out) { audio_.copySpectrumPcm(out); });
 #endif
-        display_.begin();
 #endif
         return true;
     }
@@ -262,7 +264,18 @@ public:
 #endif
 #endif
 #if DISPLAY_ENABLE
-        feedDisplay();
+        // Demarrage differe de l'ecran : apres que le service SDP vendor soit
+        // publie (sinon HTCommander ne detecte pas la radio) ET un delai mini,
+        // pour ne pas ralentir l'appairage. Repli a 15 s si le SDP tarde.
+        if (!displayStarted_ && millis() > DISPLAY_START_DELAY_MS &&
+            (vendorSdpHandle_ != 0 || millis() > 15000)) {
+            displayStarted_ = true;
+            Serial.printf("[SPP-DUAL] demarrage ecran (tas libre %u o, SDP=%s)\n",
+                          (unsigned)ESP.getFreeHeap(),
+                          vendorSdpHandle_ ? "ok" : "absent");
+            display_.begin();
+        }
+        if (displayStarted_) feedDisplay();
 #endif
 
         // Filet de securite (reconnexion) : une connexion est en attente depuis
@@ -799,6 +812,7 @@ private:
 #if DISPLAY_ENABLE
     RadioDisplay display_;
     uint32_t     dispFeedMs_ = 0;
+    bool         displayStarted_ = false;
 #endif
 
 #if TNC_ENABLE
