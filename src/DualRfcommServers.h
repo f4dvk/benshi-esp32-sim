@@ -14,6 +14,7 @@
 #include "TncModem.h"
 #include "AprsBeacon.h"
 #include "GpsNmea.h"
+#include "RadioDisplay.h"
 #include "freertos/stream_buffer.h"
 
 // ============================================================================
@@ -178,6 +179,14 @@ public:
         tncSetup();
         tncReconcile();
 #endif
+
+#if DISPLAY_ENABLE
+        // 9) Ecran de facade (ILI9225 / MCP23017).
+#if DISPLAY_SPECTRUM
+        display_.setPcmSource([this](int16_t* out) { audio_.copySpectrumPcm(out); });
+#endif
+        display_.begin();
+#endif
         return true;
     }
 
@@ -191,6 +200,46 @@ public:
 
     void sendAudioEnd() { enqueueAudio(std::vector<uint8_t>{ 0x01 }); }  // Type = AudioEnd
 
+#if DISPLAY_ENABLE
+    // Instantané pour l'écran de façade (throttlé ; le rendu est ailleurs).
+    void feedDisplay() {
+        uint32_t now = millis();
+        if (now - dispFeedMs_ < 250) return;
+        dispFeedMs_ = now;
+
+        RadioState::ActiveRf rf = handler_.activeRf();
+        RadioFace f;
+        f.rxMHz     = rf.rx_mhz;
+        f.channelId = handler_.activeChannelId();
+        strlcpy(f.channel, handler_.activeChannelName().c_str(), sizeof(f.channel));
+        f.wide      = rf.wide;
+        f.highPower = rf.tx_at_max_power;
+        f.sMeter    = (uint8_t)((handler_.rssiRaw() * 9 + 7) / 15);   // 0..15 -> 0..9
+        f.sqOpen    = handler_.sqOpen();
+        f.tx        = audio_.txToRadio() || handler_.inTx();
+#if TNC_ENABLE
+        f.txAprs    = f.tx && (millis() - beaconQueuedMs_ < 6000);
+        // Pendant la balise APRS, l'écran montre la fréquence du canal APRS
+        // (celui sur lequel la trame part réellement), pas le canal écouté.
+        if (f.txAprs && beaconDispCh_ < CHANNEL_COUNT) {
+            RadioState::ActiveRf b = handler_.channelRf(beaconDispCh_);
+            if (b.rx_mhz > 1.0) {
+                f.rxMHz     = b.rx_mhz;
+                f.wide      = b.wide;
+                f.channelId = beaconDispCh_;
+                strlcpy(f.channel, handler_.channelName(beaconDispCh_).c_str(), sizeof(f.channel));
+            }
+        }
+#endif
+        f.bt        = (cmdHandle_ != 0);
+#if (TNC_ENABLE && APRS_GPS_ENABLE)
+        f.gpsFix    = gps_.fixType();
+        f.gpsSats   = gps_.sats();
+#endif
+        display_.set(f);
+    }
+#endif
+
     // A appeler regulierement depuis loop() : retune differe du module RF +
     // traces de mise au point de la chaine audio.
     void poll() {
@@ -203,6 +252,12 @@ public:
         tncReconcile();
         aprsBeaconTick();
         aprsBeaconChannelRestore();
+#if APRS_GPS_ENABLE
+        handler_.setGpsLocked(gps_.hasFix());   // -> is_gps_locked du HT_STATUS (HTCommander)
+#endif
+#endif
+#if DISPLAY_ENABLE
+        feedDisplay();
 #endif
 
         // Filet de securite (reconnexion) : une connexion est en attente depuis
@@ -736,6 +791,10 @@ private:
     BenshiCommandHandler handler_;
     AudioBridge audio_;
     Sa818* rf_ = nullptr;
+#if DISPLAY_ENABLE
+    RadioDisplay display_;
+    uint32_t     dispFeedMs_ = 0;
+#endif
 
 #if TNC_ENABLE
     // --- TNC AX.25 / AFSK 1200 (canal APRS) -------------------------------
@@ -743,7 +802,9 @@ private:
     bool dataChanActive_ = false;                // radio sur le canal "APRS"
     uint32_t connUpSinceMs_ = 0;                 // date où COMMANDE+AUDIO tous deux mappés
     uint32_t lastBeaconMs_ = 0;                  // dernière balise APRS autonome
+    uint32_t beaconQueuedMs_ = 0;                // -> label "TX APRS" sur l'ecran
     uint8_t  beaconRestoreCh_ = 0xFF;            // canal à restaurer après balise (0xFF = rien)
+    uint8_t  beaconDispCh_ = 0xFF;               // canal réellement utilisé pour la balise (écran)
     uint32_t beaconTxStartMs_ = 0;
 #if APRS_GPS_ENABLE
     GpsNmea gps_;
@@ -964,6 +1025,7 @@ private:
         // 0 = canal courant ; sinon on cale le module RF sur le canal N-1 juste
         // avant d'émettre, et on restaure ensuite (aprsBeaconChannelRestore).
         uint8_t asc = handler_.aprsConfig().beaconChannel();
+        beaconDispCh_ = (asc != 0) ? (uint8_t)(asc - 1) : handler_.activeChannelId();
         Serial.printf("[APRS] canal balise : %u (canal actif=%u)\n",
                       asc, handler_.activeChannelId());
         if (asc != 0 && beaconRestoreCh_ == 0xFF) {
@@ -978,6 +1040,7 @@ private:
         uint16_t nn = (uint16_t)n;
         xStreamBufferSend(tncTxQ_, &nn, sizeof(nn), 0);
         xStreamBufferSend(tncTxQ_, fr,  nn,         0);
+        beaconQueuedMs_ = millis();   // -> "TX APRS" sur l'ecran
         Serial.printf("[APRS] balise %s : %.5f, %.5f  (%s-%d '%c%c' -> %u o)\n",
                       src, lat, lon, call.c_str(), cfg.ssid(),
                       cfg.symbolTable(), cfg.symbolCode(), (unsigned)n);

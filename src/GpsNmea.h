@@ -48,6 +48,9 @@ public:
         lat = lat_; lon = lon_;
         return true;
     }
+    bool    hasFix() const { double a, b; return fix(a, b); }
+    uint8_t sats()   const { return hasFix() ? sats_ : 0; }
+    uint8_t fixType() const { return hasFix() ? fixType_ : 0; }   // 0/2/3
 
 private:
     // Découpe en champs séparés par des virgules (destructif sur line_).
@@ -85,11 +88,14 @@ private:
             double lat = nmeaToDeg(f[3], f[4]);
             double lon = nmeaToDeg(f[5], f[6]);
             if (valid && !isnan(lat) && !isnan(lon)) store(lat, lon);
-        } else if (!strncmp(t, "GGA", 3) && nf >= 7) {
+        } else if (!strncmp(t, "GGA", 3) && nf >= 8) {
             int quality = atoi(f[6]);
+            sats_ = (uint8_t)atoi(f[7]);
             double lat = nmeaToDeg(f[2], f[3]);
             double lon = nmeaToDeg(f[4], f[5]);
             if (quality > 0 && !isnan(lat) && !isnan(lon)) store(lat, lon);
+        } else if (!strncmp(t, "GSA", 3) && nf >= 3) {
+            fixType_ = (uint8_t)atoi(f[2]);   // 1=aucun, 2=2D, 3=3D
         }
     }
 
@@ -105,6 +111,8 @@ private:
     double   lat_ = 0, lon_ = 0;
     uint32_t fixMs_ = 0;
     bool     haveFix_ = false;
+    uint8_t  sats_ = 0;
+    uint8_t  fixType_ = 0;
 };
 
 #endif  // APRS_GPS_ENABLE

@@ -249,7 +249,8 @@ namespace BenshiReplies {
     // Remplit les 4 octets de StatusExt dans out[0..3] (voir la disposition
     // ci-dessus). `rssi` : 0..15. `aocConn` : canal audio RFCOMM connecte.
     inline void packHtStatus(const RadioState& st, bool inTx, bool sqOpen,
-                             uint8_t rssi, bool aocConn, uint8_t out[4]) {
+                             uint8_t rssi, bool aocConn, uint8_t out[4],
+                             bool gpsLocked = false) {
         const uint8_t region = st.region() & 0x3F;
         const uint8_t chId   = st.activeChannelId();
         const uint8_t dualCh = st.doubleChannel() & 0x03;
@@ -260,6 +261,7 @@ namespace BenshiReplies {
                | (dualCh << 2)                    // double_channel (VFO actif)
                | ((st.scan() ? 1u : 0u) << 1);    // is_scan
         out[1] = ((chId & 0x0F) << 4)             // curr_ch_id[3:0]
+               | ((gpsLocked ? 1u : 0u) << 3)     // is_gps_locked
                | ((aocConn ? 1u : 0u) << 1);      // is_aoc_connected
         out[2] = ((rssi & 0x0F) << 4)             // rssi
                | ((region >> 2) & 0x0F);          // curr_region[5:2]
@@ -269,10 +271,11 @@ namespace BenshiReplies {
 
     // GET_HT_STATUS : [status][4 octets StatusExt].
     inline std::vector<uint8_t> htStatus(const RadioState& st, bool inTx, bool sqOpen,
-                                         uint8_t rssi = 0, bool aocConn = false) {
+                                         uint8_t rssi = 0, bool aocConn = false,
+                                         bool gpsLocked = false) {
         std::vector<uint8_t> b(1 + 4, 0);
         b[0] = ReplyStatus::SUCCESS;
-        packHtStatus(st, inTx, sqOpen, rssi, aocConn, &b[1]);
+        packHtStatus(st, inTx, sqOpen, rssi, aocConn, &b[1], gpsLocked);
         return b;
     }
 
@@ -280,10 +283,11 @@ namespace BenshiReplies {
     // Pas d'octet de statut : le corps colle a ce qu'emet la vraie VR-N76
     // (FF 01 00 05 00 02 00 09 01 XX XX XX XX).
     inline std::vector<uint8_t> htStatusChangedEvent(const RadioState& st, bool inTx,
-                                                     bool sqOpen, uint8_t rssi, bool aocConn) {
+                                                     bool sqOpen, uint8_t rssi, bool aocConn,
+                                                     bool gpsLocked = false) {
         std::vector<uint8_t> b(1 + 4, 0);
         b[0] = EventType::HT_STATUS_CHANGED;
-        packHtStatus(st, inTx, sqOpen, rssi, aocConn, &b[1]);
+        packHtStatus(st, inTx, sqOpen, rssi, aocConn, &b[1], gpsLocked);
         return b;
     }
 

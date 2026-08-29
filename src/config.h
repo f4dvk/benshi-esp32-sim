@@ -465,14 +465,63 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define APRS_FIXED_LON            -1.552800
 #define APRS_FIXED_ALT_M         (-1)                // altitude en m dans le commentaire ; -1 = ne pas inclure
 
-// GPS NMEA optionnel -> balise "tracker" (position dynamique). Repli sur la
-// position fixe tant qu'il n'y a pas de fix valide (< APRS_GPS_FIX_MAX_AGE_S).
-// Serial1 sur des GPIO LIBRES (pas ceux de kv4p-ht) : par défaut RX=GPIO13.
-#define APRS_GPS_ENABLE           false
-#define APRS_GPS_RX_GPIO          13                 // RX de l'ESP  <- TX du GPS
+// GPS NMEA -> balise "tracker" (position dynamique) + synchro affichée sur
+// l'écran de façade. Repli sur la position fixe tant qu'il n'y a pas de fix
+// valide (< APRS_GPS_FIX_MAX_AGE_S).
+// Serial1 sur un GPIO LIBRE (pas ceux de kv4p-ht). GPIO4 = libre en brochage
+// kv4p-ht v1 (attention : v2.0c/d y met le squelch).
+#define APRS_GPS_ENABLE           true
+#define APRS_GPS_RX_GPIO          4                  // RX de l'ESP  <- TX du GPS
 #define APRS_GPS_TX_GPIO         (-1)                // inutile (on n'écrit pas vers le GPS)
 #define APRS_GPS_BAUD             9600
 #define APRS_GPS_FIX_MAX_AGE_S    30                 // au-delà, on considère le fix perdu
+
+// ----------------------------------------------------------------------
+// 7bis) Écran de façade "portatif VHF" : ILI9225 câblé sur un expandeur
+//       GPIO MCP23017 (I2C). L'affichage est PASSIF (lecture seule) :
+//       fréquence, canal, RSSI (S-mètre), puissance, squelch, synchro GPS.
+//
+// L'écran est piloté en SPI LOGICIEL bit-bangé À TRAVERS le MCP23017 : chaque
+// octet = plusieurs transactions I2C -> l'affichage est LENT (redessin d'un
+// champ ~1 s, écran complet ~30 s au boot). Acceptable pour un tableau de bord.
+// Une tâche FreeRTOS dédiée (priorité basse) s'en charge sans gêner l'audio /
+// le Bluetooth.
+// ----------------------------------------------------------------------
+#define DISPLAY_ENABLE            true
+#define DISPLAY_I2C_SDA           21
+#define DISPLAY_I2C_SCL           22
+#define DISPLAY_I2C_FREQ          1000000            // MCP23017 tient 1,7 MHz ; 800000 / 400000 si l'I2C n'est pas fiable
+#define MCP23017_ADDR            0x20                // A0..A2 à la masse
+// Broches de l'ILI9225 sur le MCP23017 : 0..7 = GPA0..7, 8..15 = GPB0..7.
+// EN BIT-BANG (ILI9225_HW_SPI=false), SCK et SDI DOIVENT être sur le port A.
+// EN SPI MATÉRIEL (true), CLK/SDA sont sur l'ESP (ILI9225_SPI_*) et le MCP ne
+// porte plus que CS/RS/RST/LED -> ici sur le PORT B (GPB0..3).
+#define ILI9225_CS_PIN           8                   // GPB0  -> /CS
+#define ILI9225_RST_PIN          9                   // GPB1  -> /RST
+#define ILI9225_RS_PIN           10                  // GPB2  -> RS / DC
+#define ILI9225_LED_PIN          11                  // GPB3  -> rétro-éclairage (-1 = câblé en dur)
+#define ILI9225_SDI_PIN          3                   // (bit-bang seulement : GPA3 -> SDA)
+#define ILI9225_SCK_PIN          4                   // (bit-bang seulement : GPA4 -> CLK)
+#define ILI9225_LED_ON_LEVEL     1                   // 1 = niveau HAUT allume le rétro-éclairage, 0 = niveau BAS
+#define ILI9225_ROTATION         1                   // 0..3 (1 = paysage 220x176)
+#define ILI9225_INVERT           false               // true si les couleurs sont inversées
+// ACCÉLÉRATION : câbler SCK + SDA en DIRECT sur 2 GPIO de l'ESP (SPI matériel)
+// et ne laisser que CS/RS/RST/LED sur le MCP23017 -> affichage ~50x plus rapide.
+// Il faut alors débrancher CLK et SDA du MCP et les mettre sur ILI9225_SPI_SCK /
+// _MOSI. CS/RS/RST/LED restent sur le MCP (ILI9225_*_PIN ci-dessus).
+#define ILI9225_HW_SPI           true
+#define ILI9225_SPI_SCK          14                  // GPIO ESP32 <- CLK de l'ecran
+#define ILI9225_SPI_MOSI         13                  // GPIO ESP32 <- SDA de l'ecran
+#define ILI9225_SPI_HZ           26670000            // 26,67 MHz (80/3) ; baisser si l'affichage bruite
+// RS/DC sur un GPIO DE L'ESP plutôt que sur le MCP23017 : -1 = laissé sur le
+// MCP (via I2C, lent) ; un n° de GPIO = câbler RS dessus -> chaque fenêtre GRAM
+// coûte 2 transactions I2C au lieu de ~14 => balayage plusieurs fois plus
+// rapide. C'est LE levier de vitesse (1 seul fil à ajouter).
+#define ILI9225_SPI_RS           (-1)                // ex. 27 pour câbler RS sur GPIO27
+#define DISPLAY_FULL_CLEAR       true                // false : ne pas remplir le fond en noir (~10 s gagnées au boot, mais bruit entre les zones)
+#define DISPLAY_REFRESH_MS       130                 // cadence de la tâche d'affichage (ne redessine QUE ce qui change)
+#define DISPLAY_SPECTRUM         true                // analyseur de spectre de l'audio reçu (FFT 256 pts)
+#define DISPLAY_SPECTRUM_MS      130                 // cadence de rafraîchissement du spectre
 
 // ----------------------------------------------------------------------
 // 7) Traces de mise au point

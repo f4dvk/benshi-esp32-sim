@@ -236,7 +236,59 @@ adaptateur serve aux deux projets.
 | **PD module RF** | **19** | `PIN_PD` | Alimentation du module SA818 (HIGH = allumé). `-1` si non câblé. Inutile en mode UV-K1. |
 | PTT local (option) | `-1` | `PIN_PHYS_PTT1/2` (5 / 33) | Force la capture ADC → HTCommander comme si le squelch était ouvert. |
 | LED d'état (option) | `-1` | `PIN_LED` (2) | Fixe en émission, clignote en réception. |
-| **GPS NMEA** (option) | **13** | — | RX de l'ESP ← TX du GPS, `Serial1` @ 9600. Utilisé **uniquement** si `APRS_GPS_ENABLE = true` (balise APRS « tracker »). Choisir un GPIO libre. |
+| **GPS NMEA** | **4** | — | RX de l'ESP ← TX du GPS, `Serial1` @ 9600 (`APRS_GPS_*`). GPIO4 libre en brochage kv4p-ht v1 (v2.0c/d y met le squelch). Alimente la balise « tracker » + la synchro GPS de l'écran. |
+| **Écran / MCP23017** | **21 / 22** | — | Bus I2C (`DISPLAY_I2C_SDA` / `SCL`) vers l'expandeur MCP23017 (`MCP23017_ADDR` 0x20). |
+
+### Écran de façade « portatif VHF »
+
+Écran **ILI9225** (TFT 176×220) câblé sur un **expandeur GPIO MCP23017** (I2C),
+look **Icom IC-7760** : cadres cyan, **fréquence VFO en matrice de carrés**
+(LED dot-matrix 5×9 par chiffre, 6 chiffres MHz/kHz + unités kHz plus petites,
+séparateur ; blanc en réception, rouge en émission), badge mode encadré,
+**S-mètre calé sur l'échelle Icom** (S1–S9 en vert puis +20/+40/+60 en rouge),
+**analyseur de spectre de l'audio reçu** (FFT 256 points, 0–3 kHz, tracé en
+courbe colorée vert→ambre→rouge selon l'amplitude ; `DISPLAY_SPECTRUM`),
+bloc de statut, barre GPS/BT.
+Affichage **passif** (lecture seule). Pendant l'émission d'une balise APRS,
+la fréquence affichée est celle du **canal APRS** (canal réellement utilisé
+pour la trame), pas celle du canal écouté, et le bloc de statut indique
+`TX APRS`.
+
+Toutes les lignes de l'écran passent par le MCP23017 (SPI **logiciel bit-bangé**
+à travers l'I2C, `BANK=1`+`SEQOP=1` pour figer le pointeur sur `GPIOA`) →
+affichage **lent** : ~10 s pour le fond au boot (`DISPLAY_FULL_CLEAR false` pour
+le sauter), ~1 s pour redessiner un champ. En fonctionnement seuls les champs
+qui **changent** sont redessinés (S-mètre à segments, badges TX/RX/SQ/PWR),
+donc c'est fluide. Une tâche FreeRTOS dédiée (priorité basse) s'en occupe sans
+gêner l'audio ni le Bluetooth. `DISPLAY_I2C_FREQ` = 1 MHz (baisser si l'I2C
+n'est pas fiable).
+
+Câblage **par défaut = mode rapide** (`ILI9225_HW_SPI = true`) :
+
+| ILI9225 | Vers | `config.h` |
+|---|---|---|
+| CLK / SCK | **GPIO 14** de l'ESP32 (SPI matériel HSPI) | `ILI9225_SPI_SCK` |
+| SDA / MOSI | **GPIO 13** de l'ESP32 | `ILI9225_SPI_MOSI` |
+| /CS | MCP23017 **GPB0** | `ILI9225_CS_PIN` (8) |
+| /RST | MCP23017 **GPB1** | `ILI9225_RST_PIN` (9) |
+| RS / DC | MCP23017 **GPB2** (ou GPIO ESP, voir ci-dessous) | `ILI9225_RS_PIN` (10) |
+| LED | MCP23017 **GPB3** | `ILI9225_LED_PIN` (11, `-1` = câblé en dur) |
+
+`ILI9225_ROTATION` (0..3) : orientation ; `1` = paysage 220×176.
+`DISPLAY_ENABLE = false` retire tout (pilotes maison, aucune dépendance).
+
+**Accélérer encore le balayage** : chaque fenêtre GRAM impose ~14 bascules des
+lignes de contrôle ; tant que RS passe par le MCP23017 (I2C), c'est le poste le
+plus lent. Câbler **RS sur un GPIO de l'ESP** et renseigner
+`ILI9225_SPI_RS` (ex. `27`) fait tomber ce coût à 2 transactions I2C par
+fenêtre → balayage **plusieurs fois plus rapide**, pour un seul fil de plus.
+Le pilote regroupe déjà les registres d'une fenêtre en une transaction SPI
+unique (CS maintenu bas), dé-duplique les écritures I2C et trace chaque chiffre
+de la fréquence en **un seul bloc** (`Ili9225::blit`). `ILI9225_SPI_HZ` = 26,67 MHz.
+
+**Mode lent** (`ILI9225_HW_SPI = false`) : tout passe par le MCP23017, `SCK`
+sur `ILI9225_SCK_PIN` et `SDI` sur `ILI9225_SDI_PIN`, et **les 6 lignes doivent
+être sur le port A** (GPA0..7). ~50× plus lent (bit-bang à travers l'I2C).
 
 ### Balise APRS autonome
 

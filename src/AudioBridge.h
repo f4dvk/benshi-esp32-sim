@@ -62,6 +62,17 @@ public:
     void setDataMode(bool on)       { dataMode_.store(on); }
     bool dataMode() const           { return dataMode_.load(); }
 
+    // --- Capture pour l'analyseur de spectre de l'écran de façade ---
+    // Anneau des derniers échantillons ADC (audio reçu du poste), alimenté par
+    // la tâche audio. La tâche d'affichage en prend une copie et fait la FFT.
+    static const size_t kSpecN = 256;
+    void copySpectrumPcm(int16_t* out) {
+        portENTER_CRITICAL(&specMux_);
+        size_t h = specHead_;
+        for (size_t i = 0; i < kSpecN; i++) out[i] = specBuf_[(h + i) & (kSpecN - 1)];
+        portEXIT_CRITICAL(&specMux_);
+    }
+
     // Poussé par le modulateur AFSK (bloque si la file DAC est pleine -> cadence
     // la génération sur le temps réel).
     void dataTxAudio(const int16_t* pcm, size_t n) {
@@ -107,7 +118,7 @@ public:
         // ADC interne prend un mutex RECURSIF (adc1_i2s_lock) qui doit etre
         // pris ET rendu par la MEME tache -> sinon assert au 1er passage TX.
 
-        xTaskCreatePinnedToCore(&AudioBridge::pumpTrampoline, "audio_pump", 4352, this, 6, &pumpTask_, 1);
+        xTaskCreatePinnedToCore(&AudioBridge::pumpTrampoline, "audio_pump", 4608, this, 6, &pumpTask_, 1);
         xTaskCreatePinnedToCore(&AudioBridge::rxTrampoline,   "audio_rx",   3584, this, 5, &rxTask_,   1);
         xTaskCreatePinnedToCore(&AudioBridge::txTrampoline,   "audio_tx",   3072, this, 5, &txTask_,   1);
         xTaskCreatePinnedToCore(&AudioBridge::ctlTrampoline,  "audio_ctl",  2560, this, 4, &ctlTask_,  1);
@@ -355,6 +366,7 @@ private:
     void pumpLoop() {
         uint16_t adc[kFrame];
         int16_t  mic[kFrame];        // ADC (après gain/AGC), au débit I2S
+        int16_t  rawSpec[kFrame];    // ADC AVANT AGC (analyseur de spectre écran)
         int16_t  pcmOut[kFrame * 2]; // PCM à envoyer au DAC (débit I2S)
         uint16_t dac[kFrame * 3];    // stéréo, marge pour un éventuel sur-échantillonnage
 #if AUDIO_I2S_RATE != AUDIO_SAMPLE_RATE_HZ
@@ -379,6 +391,13 @@ private:
                         micDc_ = 2048.0f;
 #endif
                         float pre = (float)raw - micDc_;
+                        // Spectre écran : signal AVANT AGC (sinon l'AGC monte à
+                        // fond sur le silence et le spectre "colle" en haut).
+                        {
+                            float pg = pre * 16.0f;
+                            rawSpec[i] = pg > 32767.f ? 32767
+                                       : (pg < -32768.f ? -32768 : (int16_t)pg);
+                        }
 #if AUDIO_AGC_ENABLE
                         float s = pre * agcGain_;
                         float rect = s < 0 ? -s : s;
@@ -408,6 +427,7 @@ private:
                         adcEnv_ += ((float)mean - adcEnv_) * 0.25f;
                         adcLevel_.store((uint32_t)adcEnv_);
                         adcSamples_.fetch_add(cnt);
+                        pushSpec_(rawSpec, cnt);   // -> analyseur de spectre (écran)
                     }
                     // --- Chaîne SBC (phonie / flux audio vers HTCommander) ---
                     // Active sur tous les canaux ; sur le canal APRS seulement
@@ -643,6 +663,20 @@ private:
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
+
+    // Anneau de capture pour l'analyseur de spectre (écrit par la tâche audio,
+    // lu par la tâche d'affichage sous section critique — copie rapide).
+    void pushSpec_(const int16_t* s, size_t n) {
+        portENTER_CRITICAL(&specMux_);
+        for (size_t i = 0; i < n; i++) {
+            specBuf_[specHead_] = s[i];
+            specHead_ = (specHead_ + 1) & (kSpecN - 1);
+        }
+        portEXIT_CRITICAL(&specMux_);
+    }
+    portMUX_TYPE specMux_ = portMUX_INITIALIZER_UNLOCKED;
+    int16_t      specBuf_[kSpecN] = {0};
+    size_t       specHead_ = 0;
 
     // ---------------- Données membres ---------------------------------
     sbc::Decoder decoder_;

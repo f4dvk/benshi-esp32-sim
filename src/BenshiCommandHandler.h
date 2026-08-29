@@ -57,6 +57,21 @@ public:
     String  activeChannelName() { return state_.activeChannelName(); }
     uint8_t activeChannelId()   { return state_.activeChannelId(); }
 
+    // Accès lecture seule pour l'écran de façade.
+    RadioState::ActiveRf activeRf() { return state_.activeRf(); }
+    uint8_t rssiRaw()  const { return rssi_.load(); }      // 0..15
+    bool    sqOpen()   const { return sqOpen_.load(); }
+    bool    inTx()     const { return inTx_.load(); }
+    bool    aocConnected() const { return aocConnected_.load(); }
+    uint8_t volume()   const { return volume_; }
+
+    // Synchro GPS (module NMEA sur l'ESP) -> bit is_gps_locked du HT_STATUS,
+    // affiché par HTCommander (barre d'état / carte).
+    void setGpsLocked(bool l) {
+        if (l == gpsLocked_.exchange(l)) return;
+        emitHtStatusChanged();
+    }
+
     // Émet une commande NON sollicitée sur le canal commande (ex. RX_DATA).
     void emitCommand(uint16_t cmd, const uint8_t* body, size_t len) {
         if (!sink_) return;
@@ -128,6 +143,14 @@ public:
 
     // Canal de balise APRS réglé dans HTCommander (0 = canal courant).
     uint8_t autoShareLocCh() const { return state_.autoShareLocCh(); }
+
+    // Paramètres RF / nom d'un canal mémoire quelconque (écran de façade :
+    // afficher la fréquence du canal APRS pendant l'émission de la balise).
+    RadioState::ActiveRf channelRf(uint8_t id) {
+        RadioState::ActiveRf empty;
+        return (id < CHANNEL_COUNT) ? RadioState::decodeRf(state_.channelStruct(id)) : empty;
+    }
+    String channelName(uint8_t id) { return state_.channelNameOf(id); }
 
     // Appelé périodiquement par le transport (boucle Arduino).
     void pollRf() {
@@ -262,7 +285,8 @@ public:
 
         } else if (in.command == GET_HT_STATUS) {
             outMsg.body = BenshiReplies::htStatus(state_, inTx_.load(), sqOpen_.load(),
-                                                  rssi_.load(), aocConnected_.load());
+                                                  rssi_.load(), aocConnected_.load(),
+                                                  gpsLocked_.load());
 
         } else if (in.command == HT_SEND_DATA) {
             if (dataTxCb_) dataTxCb_(in.body.data(), in.body.size());
@@ -386,7 +410,8 @@ public:
         m.is_reply      = false;
         m.command       = BasicCommand::EVENT_NOTIFICATION;
         m.body = BenshiReplies::htStatusChangedEvent(state_, inTx_.load(), sqOpen_.load(),
-                                                     rssi_.load(), aocConnected_.load());
+                                                     rssi_.load(), aocConnected_.load(),
+                                                     gpsLocked_.load());
         sink_(m);
     }
 
@@ -426,5 +451,6 @@ private:
     std::atomic<bool>    sa818RssiValid_{false}; // une lecture module a réussi
     std::atomic<bool>    aocConnected_{false};
     std::atomic<bool>    inTx_{false};
+    std::atomic<bool>    gpsLocked_{false};
     uint8_t              volume_ = RF_MODULE_VOLUME;
 };
