@@ -31,16 +31,18 @@
 Au boot, l'ESP tente un handshake `AT+DMOCONNECT` sur l'UART RF
 (GPIO16/17). Selon le résultat :
 
-| | **Mode SA818** | **Mode UV-K1** (historique) |
-|---|---|---|
-| Condition | un module **SA818 / DRA818** répond (≤ `RF_MODULE_PROBES` essais, 3 par défaut) | aucun module détecté |
-| Rôle de l'ESP | **pilote un vrai module RF** : les canaux de `config.h` sont des fréquences réelles ; changer de canal / VFO dans HTCommander **retune** le module (`AT+DMOSETGROUP`) | **simule** entièrement la radio (fréquences, canaux, statut) et sert de **passerelle audio/PTT/squelch** vers un poste externe non pilotable |
-| Audio / PTT / squelch | vers le module SA818 | vers le poste externe (ex. Quansheng UV-K1) |
-| Interface HTCommander | **identique** (Bluetooth Classic, protocole Benshi) | **identique** |
+| | **Mode SA818** | **Mode UV-K1 piloté** | **Mode UV-K1** (historique) |
+|---|---|---|---|
+| Condition | un **SA818 / DRA818** répond sur l'UART RF | pas de SA818, `RF_MODULE_UVK5_ENABLE = true`, et un poste **Quansheng UV-K1 / UV-K5 V3** (firmware `firmware/uv-k1-k5v3/`, mode hôte) répond à 38400 bauds | aucun des deux |
+| Rôle de l'ESP | **pilote un module RF** : les canaux `config.h` sont réels ; changer de canal / VFO dans HTCommander **retune** (`AT+DMOSETGROUP`) | **pilote le poste Quansheng en série** : fréquences RX/TX, CTCSS/DCS, puissance, squelch, PTT, S‑mètre, mémoires (voir `firmware/uv-k1-k5v3/`) | **simule** entièrement la radio + **passerelle audio/PTT/squelch** vers un poste externe non pilotable |
+| Audio | vers le SA818 | **analogique** : HP du poste → ADC ESP, DAC ESP → micro du poste | vers le poste externe |
+| Interface HTCommander | **identique** | **identique** | **identique** |
 
 Le brochage suit celui de [kv4p-ht](https://github.com/VanceVagell/kv4p-ht)
-pour que la même carte serve aux deux usages (`RF_MODULE_ENABLE = false`
-force le mode UV-K1 sans sonder l'UART).
+pour que la même carte serve aux trois usages (`RF_MODULE_ENABLE = false`
+désactive la sonde SA818 ; `RF_MODULE_UVK5_ENABLE = true` active la sonde
+UV-K1). Le poste Quansheng se câble sur le même UART RF (PA9/PA10 du poste →
+GPIO 16/17 de l'ESP).
 
 > Le **mode SA818** est validé sur matériel. Le **mode UV-K1** partage la même
 > chaîne audio/PTT/squelch mais n'a pas encore été testé bout à bout avec un

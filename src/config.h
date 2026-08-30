@@ -371,6 +371,32 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //   - puissance haute / basse                (broche H/L)       -> bit tx_at_max_power (si RF_MODULE_HL_GPIO)
 
 // ----------------------------------------------------------------------
+// 6bis) Pilotage d'un poste Quansheng UV-K1 / UV-K5 V3 (port série)
+// ----------------------------------------------------------------------
+// Alternative au SA818 : si aucun module SA818 n'est détecté, l'ESP tente de
+// dialoguer avec un poste Quansheng UV-K1 / UV-K5 V3 sur l'UART RF, en protocole
+// série Quansheng (trame AB CD ... DC BA, charge masquée, CRC-16/XMODEM), à
+// 38400 bauds. Le poste doit tourner le firmware du dossier firmware/uv-k1-k5v3/
+// (mode hôte). L'ESP pilote alors fréquences/VFO/mémoires/mode/CTCSS/PTT depuis
+// HTCommander, comme le mode SA818 mais avec beaucoup plus de contrôle.
+// Réutilise le brochage RF_MODULE_UART_RX / _TX (16 / 17). L'audio reste
+// analogique (HP du poste -> ADC ESP, DAC ESP -> micro du poste).
+#define RF_MODULE_UVK5_ENABLE     false     // true -> sonde UV-K1 si pas de SA818
+#define RF_MODULE_UVK5_BAUD       38400     // débit série du poste Quansheng
+#define RF_MODULE_UVK5_KEEPALIVE_MS 3000    // période du GET_STATUS (watchdog mode hôte)
+#define RF_MODULE_UVK5_MODULATION 0         // 0 = FM, 1 = AM, 2 = USB (canal Benshi = FM)
+// Squelch envoyé au poste : réutilise state_.squelch() de HTCommander, borné
+// 0..9. 0 = AF permanent (données / APRS) ; 1..9 = squelch + gating CTCSS RX
+// (phonie). Le firmware ferme le HP hors signal, l'ESP lit le bit "signal reçu"
+// dans GET_STATUS pour le S-mètre / is_sq.
+
+// Test de sanité de la liaison série (Phase 1) : ne fait RIEN d'autre que
+// sonder le poste et lire le registre BK4819 0x67 (RSSI) toutes les 2 s, en
+// boucle. Ne démarre ni Bluetooth ni le reste. Nécessite un firmware compilé
+// avec ENABLE_UART_RW_BK_REGS (le .bin actuel de firmware/uv-k1-k5v3/).
+#define RF_MODULE_UVK5_SELFTEST   false
+
+// ----------------------------------------------------------------------
 // 7bis) TNC AX.25 / AFSK 1200 (canal données APRS)
 // ----------------------------------------------------------------------
 // Quand la radio est sur le canal nommé TNC_CHANNEL_NAME, l'ESP fait TNC :

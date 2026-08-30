@@ -7,9 +7,18 @@
     #include "Sa818.h"
     DualRfcommServers rfcomm;
     Sa818 rfModule;
+    #if RF_MODULE_UVK5_ENABLE
+        #include "UvK5.h"
+        UvK5 uvk5Module;
+    #endif
 #else
     #include "AudioRfcomm.h"
     BenshiAudioLink rfcomm;
+#endif
+
+#if RF_MODULE_UVK5_SELFTEST
+    #include "UvK5Link.h"
+    static UvK5Link uvk5link;
 #endif
 
 void setup() {
@@ -18,6 +27,24 @@ void setup() {
     Serial.println("\n=== Simulateur radio Benshi (VR-N76) sur ESP32 ===");
     Serial.printf("[BUILD] firmware compile le %s %s\n", __DATE__, __TIME__);
     Serial.println("[INFO] Bluetooth Classic uniquement (voir config.h / README)");
+
+#if RF_MODULE_UVK5_SELFTEST
+    Serial.println("[UVK5] === TEST DE SANITE LIAISON SERIE (Phase 1) ===");
+    Serial.printf("[UVK5] UART RF : RX=GPIO%d TX=GPIO%d @ %d bauds\n",
+                  RF_MODULE_UART_RX, RF_MODULE_UART_TX, RF_MODULE_UVK5_BAUD);
+    uvk5link.begin(&Serial2, RF_MODULE_UART_RX, RF_MODULE_UART_TX, RF_MODULE_UVK5_BAUD);
+    delay(200);
+    if (!uvk5link.probe())
+        Serial.println("[UVK5] pas de reponse 0x0514 (cable croise ? baud ? firmware ?)");
+    for (;;) {
+        uint16_t r67 = 0;
+        if (uvk5link.readBkReg(0x67, r67))
+            Serial.printf("[UVK5] BK4819 REG_67 = 0x%04X (RSSI brut %u)\n", r67, r67 & 0x1FF);
+        else
+            Serial.println("[UVK5] lecture REG_67 : pas de reponse");
+        delay(2000);
+    }
+#endif
 
 #if OVERRIDE_BT_MAC
     // Sur l'ESP32, la MAC Bluetooth = base MAC avec le dernier octet + 2
@@ -46,14 +73,33 @@ void setup() {
                        RF_MODULE_PD_GPIO, RF_MODULE_PROBES)) {
         rf = &rfModule;
         Serial.println("[MODE] === SA818 : pilotage d'un module RF reel ===");
-    } else {
-        Serial.println("[MODE] === UV-K1 : simulation + passerelle vers poste externe ===");
     }
 #else
-    Serial.println("[MODE] === UV-K1 : sonde SA818 desactivee (RF_MODULE_ENABLE=false) ===");
+    Serial.println("[MODE] === sonde SA818 desactivee (RF_MODULE_ENABLE=false) ===");
 #endif
 
+#if RF_MODULE_UVK5_ENABLE
+    UvK5* uvk5 = nullptr;
+    if (!rf) {
+        // Pas de SA818 -> tente un poste Quansheng UV-K1 / UV-K5 V3 (mode hote)
+        // sur le meme UART, a 38400 bauds.
+        Serial.println("[MODE] Recherche d'un poste Quansheng UV-K1 / UV-K5 V3...");
+        Serial2.end();
+        if (uvk5Module.begin(&Serial2)) {
+            uvk5 = &uvk5Module;
+            Serial.println("[MODE] === UV-K1 : poste Quansheng pilote (mode hote) ===");
+        } else {
+            Serial2.end();
+        }
+    }
+    if (!rf && !uvk5)
+        Serial.println("[MODE] === UV-K1 : simulation + passerelle vers poste externe ===");
+    if (!rfcomm.begin(rf, uvk5)) {
+#else
+    if (!rf)
+        Serial.println("[MODE] === UV-K1 : simulation + passerelle vers poste externe ===");
     if (!rfcomm.begin(rf)) {
+#endif
         Serial.println("[FATAL] Demarrage Bluetooth Classic impossible (voir erreurs ci-dessus).");
         Serial.println("        Verifie que la carte est bien un ESP32 'classique' (WROOM-32 /");
         Serial.println("        DevKitC / WROVER) : les S3/C3/C6 n'ont pas de Bluetooth Classic.");

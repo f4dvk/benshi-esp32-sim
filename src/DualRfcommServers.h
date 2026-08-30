@@ -16,6 +16,9 @@
 #include "GpsNmea.h"
 #include "FaceDisplay.h"
 #include "freertos/stream_buffer.h"
+#if RF_MODULE_UVK5_ENABLE
+#include "UvK5.h"
+#endif
 
 // ============================================================================
 // MODULE LE PLUS EXPERIMENTAL DE CE PROJET - NON TESTE SUR MATERIEL REEL.
@@ -51,10 +54,21 @@
 class DualRfcommServers {
 public:
     // rf != nullptr && rf->present() -> mode SA818 (module RF réel piloté).
+    // uvk5 != nullptr && uvk5->present() -> mode "UV-K1" (poste Quansheng piloté
+    // en série, mode hôte) ; exclusif du SA818.
+#if RF_MODULE_UVK5_ENABLE
+    bool begin(Sa818* rf = nullptr, UvK5* uvk5 = nullptr) {
+        instance_ = this;
+        handler_.setRfModule(rf);
+        handler_.setUvK5(uvk5);
+        rf_ = rf;
+        uvk5_ = uvk5;
+#else
     bool begin(Sa818* rf = nullptr) {
         instance_ = this;
         handler_.setRfModule(rf);
         rf_ = rf;
+#endif
         if (!audioMtx_)  audioMtx_  = xSemaphoreCreateMutex();
         if (!audioTxSb_) audioTxSb_ = xStreamBufferCreate(kAudioSbBytes, 1);
 
@@ -170,6 +184,11 @@ public:
             rf_->setVolume(RF_MODULE_VOLUME);
             handler_.syncRf();                      // fait aussi tune + filtres + puissance
         }
+#if RF_MODULE_UVK5_ENABLE
+        // 7bis) Mode UV-K1 : cale le poste Quansheng sur le canal actif.
+        if (uvk5_ && uvk5_->present())
+            handler_.syncRf();
+#endif
 
 #if DISPLAY_ENABLE
         // 8) Ecran de facade : DETECTION du type d'ecran (ILI9225 / ILI9341 /
@@ -847,6 +866,9 @@ private:
     BenshiCommandHandler handler_;
     AudioBridge audio_;
     Sa818* rf_ = nullptr;
+#if RF_MODULE_UVK5_ENABLE
+    UvK5*  uvk5_ = nullptr;
+#endif
 #if DISPLAY_ENABLE
     FaceDisplay  display_;
     uint32_t     dispFeedMs_ = 0;

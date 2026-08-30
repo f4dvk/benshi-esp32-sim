@@ -6,6 +6,9 @@
 #include "AprsConfig.h"
 #include "Sa818.h"
 #include "config.h"
+#if RF_MODULE_UVK5_ENABLE
+#include "UvK5.h"
+#endif
 
 // ============================================================================
 // Logique métier : quelle commande -> quelle réponse, en s'appuyant sur
@@ -86,10 +89,18 @@ public:
     // Mode SA818 : module RF réel à piloter (nullptr = mode "UV-K1" simulé).
     void setRfModule(Sa818* rf) { rf_ = rf; }
 
+#if RF_MODULE_UVK5_ENABLE
+    // Mode "UV-K1" : poste Quansheng piloté en série (mode hôte).
+    void setUvK5(UvK5* u) { uvk5_ = u; }
+#endif
+
     // Retune le module RF sur le canal actif (I/O UART bloquante ~ms).
     // À appeler depuis un contexte non critique (boucle Arduino), pas depuis
     // le callback Bluetooth.
     void syncRf() {
+#if RF_MODULE_UVK5_ENABLE
+        if (uvk5_ && uvk5_->present()) { syncUvK5(); return; }
+#endif
         if (!rf_ || !rf_->present()) return;
         RadioState::ActiveRf rf = state_.activeRf();
         if (rf.tx_mhz < 1.0 || rf.rx_mhz < 1.0) {
@@ -129,9 +140,13 @@ public:
     // sur un canal dédié). N'affecte pas l'état "canal actif" -> restaurer avec
     // syncRf(). Sans effet en mode UV-K1. Renvoie true si le retune a eu lieu.
     bool syncRfToChannel(uint8_t id) {
-        if (!rf_ || !rf_->present() || id >= CHANNEL_COUNT) return false;
+        if (id >= CHANNEL_COUNT) return false;
         RadioState::ActiveRf rf = RadioState::decodeRf(state_.channelStruct(id));
         if (rf.tx_mhz < 1.0 || rf.rx_mhz < 1.0) return false;
+#if RF_MODULE_UVK5_ENABLE
+        if (uvk5_ && uvk5_->present()) return uvk5_->applyVfo(0, uvk5Params(rf));
+#endif
+        if (!rf_ || !rf_->present()) return false;
         int sql = state_.squelch(); if (sql > 8) sql = 8;
         bool ok = rf_->tune(rf.rx_mhz, rf.tx_mhz, rf.rx_ctcss_hz, rf.tx_ctcss_hz, rf.wide, sql);
         bool filt = !rf.emph_bypass;
@@ -169,6 +184,9 @@ public:
         }
         if (rfDirty_.exchange(false)) syncRf();
         pollRssiSa818();
+#if RF_MODULE_UVK5_ENABLE
+        pollUvK5();
+#endif
     }
 
     // MODE SA818 : interroge le RSSI réel du module ("RSSI?", 0..255) et le
@@ -197,6 +215,60 @@ public:
         }
 #endif
     }
+
+#if RF_MODULE_UVK5_ENABLE
+    // Traduit un canal Benshi -> paramètres RF du poste Quansheng.
+    UvK5::RfParams uvk5Params(const RadioState::ActiveRf& rf) {
+        UvK5::RfParams p;
+        p.rxMHz = rf.rx_mhz;  p.txMHz = rf.tx_mhz;
+        p.rxCtcssHz = rf.rx_ctcss_hz;  p.txCtcssHz = rf.tx_ctcss_hz;
+        p.wide  = rf.wide;
+        p.power = rf.tx_at_max_power ? 7 /*HIGH*/ : 4 /*LOW4*/;
+        int sql = state_.squelch();  if (sql < 0) sql = 0;  if (sql > 9) sql = 9;
+        p.squelch = (uint8_t)sql;
+        return p;
+    }
+
+    void syncUvK5() {
+        RadioState::ActiveRf rf = state_.activeRf();
+        if (rf.tx_mhz < 1.0 || rf.rx_mhz < 1.0) {
+            Serial.printf("[UVK5] canal %u : frequences invalides -> pas de retune\n",
+                          state_.activeChannelId());
+            return;
+        }
+        bool ok = uvk5_->applyVfo(0, uvk5Params(rf));
+        uvk5_->setRadio(0, 0 /*dual watch off*/);
+        Serial.printf("[UVK5] retune canal %u : RX %.4f / TX %.4f MHz, %s, "
+                      "CTCSS %.1f/%.1f, squelch %d -> %s\n",
+                      state_.activeChannelId(), rf.rx_mhz, rf.tx_mhz,
+                      rf.wide ? "large" : "etroit", rf.rx_ctcss_hz, rf.tx_ctcss_hz,
+                      state_.squelch(), ok ? "OK" : "ECHEC");
+    }
+
+    // Boucle Arduino : applique le PTT différé + keepalive + pousse le statut
+    // (S-mètre / squelch) vers le HT_STATUS.
+    void pollUvK5() {
+        if (!uvk5_ || !uvk5_->present()) return;
+
+        int8_t want = pendingPtt_.load();
+        if (want >= 0 && (bool)want != pttApplied_) {
+            uvk5_->ptt(want != 0);
+            pttApplied_ = (want != 0);
+        }
+
+        uvk5_->poll();   // keepalive GET_STATUS toutes les ~3 s
+
+        const UvK5::Status& s = uvk5_->lastStatus();
+        if (s.stamp == 0 || millis() - s.stamp > 4000) return;   // pas de statut frais
+        // is_sq / is_in_rx + S-mètre 0..15 (jamais pendant l'émission).
+        bool rx = s.sig && !pttApplied_;
+        uint8_t r = rx ? (s.sMeter ? s.sMeter : 1) : 0;
+        bool changed = (rx != sqOpen_.load()) || (r != rssi_.load());
+        sqOpen_.store(rx);
+        rssi_.store(r);
+        if (changed) emitHtStatusChanged();
+    }
+#endif
 
     // Traite un message entrant et renvoie true si une réponse doit être
     // envoyée (outMsg rempli).
@@ -404,6 +476,11 @@ public:
     }
     // Émission vers le poste (HTCommander envoie de l'audio) : is_in_tx.
     void setAudioTx(bool tx) {
+#if RF_MODULE_UVK5_ENABLE
+        // Mode UV-K1 : le keying se fait par commande série (0x0633), appliquée
+        // depuis la boucle Arduino (pollUvK5), pas depuis la tâche audio.
+        if (uvk5_) pendingPtt_.store(tx ? 1 : 0);
+#endif
         if (tx == inTx_.load()) return;
         inTx_.store(tx);
         emitHtStatusChanged();
@@ -452,6 +529,11 @@ private:
     NotifSink  sink_;
     DataTxFn   dataTxCb_;
     Sa818*     rf_ = nullptr;
+#if RF_MODULE_UVK5_ENABLE
+    UvK5*      uvk5_ = nullptr;
+    std::atomic<int8_t> pendingPtt_{-1};   // -1 aucun, 0/1 état PTT demandé
+    bool       pttApplied_ = false;
+#endif
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré
     bool     htStatusDirty_  = false;
