@@ -8,8 +8,11 @@
 // ============================================================================
 // Lecteur NMEA minimal pour balise APRS "tracker" (position dynamique).
 //
-// Analyse $--RMC (position + validité) et $--GGA (position) sur un UART libre
-// (Serial1, GPIO configurables). Ne dépend d'aucune bibliothèque.
+// Analyse $--RMC (position + validité) et $--GGA (position). Le GPS est
+// TOUJOURS lu sur un UART LOGICIEL (SoftwareSerial, RX seul) sur
+// APRS_GPS_RX_GPIO : les 3 UART matériels de l'ESP32 sont pris (USB debug +
+// SA818 + éventuel Nextion). Le checksum NMEA est vérifié -> une trame perdue
+// (charge d'interruptions Bluetooth) est simplement ignorée.
 //
 //   gps.begin();                 // dans setup()
 //   gps.poll();                  // souvent (boucle Arduino)
@@ -19,27 +22,17 @@
 
 #if APRS_GPS_ENABLE
 
-// L'écran Nextion occupe Serial1 -> le GPS passe alors sur un UART logiciel
-// (RX seul). Sinon il garde le port matériel Serial1.
-#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_NEXTION)
 #include <SoftwareSerial.h>
-#define GPS_USE_SOFTSERIAL 1
-#endif
 
 class GpsNmea {
 public:
     void begin() {
-#if GPS_USE_SOFTSERIAL
-        ss_.begin(APRS_GPS_BAUD, SWSERIAL_8N1, NEXTION_GPS_SOFT_RX_GPIO, -1);
+        // Gros tampon RX (256 o ~ 260 ms @ 9600) : encaisse une boucle Arduino
+        // ralentie par la tâche d'affichage sans perdre de trames.
+        ss_.begin(APRS_GPS_BAUD, SWSERIAL_8N1, APRS_GPS_RX_GPIO, -1, false, 256);
         ser_ = &ss_;
-        Serial.printf("[GPS] NMEA sur SoftwareSerial RX=GPIO%d @ %d bauds "
-                      "(Nextion occupe Serial1)\n", NEXTION_GPS_SOFT_RX_GPIO, APRS_GPS_BAUD);
-#else
-        Serial1.begin(APRS_GPS_BAUD, SERIAL_8N1, APRS_GPS_RX_GPIO, APRS_GPS_TX_GPIO);
-        ser_ = &Serial1;
-        Serial.printf("[GPS] NMEA sur Serial1 RX=GPIO%d @ %d bauds\n",
+        Serial.printf("[GPS] NMEA sur SoftwareSerial RX=GPIO%d @ %d bauds\n",
                       APRS_GPS_RX_GPIO, APRS_GPS_BAUD);
-#endif
     }
 
     void poll() {
@@ -154,9 +147,7 @@ private:
         haveFix_ = true;
     }
 
-#if GPS_USE_SOFTSERIAL
     SoftwareSerial ss_;
-#endif
     Stream*  ser_ = nullptr;
     char     line_[100];
     size_t   len_ = 0;

@@ -3,7 +3,7 @@
 #include <Wire.h>
 #include "config.h"
 
-#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_ILI9225)
+#if DISPLAY_HAS_ILI9225
 
 #include <functional>
 #include "RadioFace.h"
@@ -404,4 +404,4 @@ private:
 #endif
 };
 
-#endif  // DISPLAY_ENABLE && DISPLAY_DRIVER == ILI9225
+#endif  // DISPLAY_HAS_ILI9225

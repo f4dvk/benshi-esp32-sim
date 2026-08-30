@@ -3,7 +3,7 @@
 #include <stdarg.h>
 #include "config.h"
 
-#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_NEXTION)
+#if DISPLAY_HAS_NEXTION
 
 #include <functional>
 #include "RadioFace.h"
@@ -231,4 +231,4 @@ private:
 #endif
 };
 
-#endif  // DISPLAY_ENABLE && DISPLAY_DRIVER == NEXTION
+#endif  // DISPLAY_HAS_NEXTION

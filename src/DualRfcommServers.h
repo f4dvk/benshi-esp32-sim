@@ -14,13 +14,7 @@
 #include "TncModem.h"
 #include "AprsBeacon.h"
 #include "GpsNmea.h"
-#include "RadioDisplay.h"
-#include "NextionDisplay.h"
-#if (DISPLAY_ENABLE && DISPLAY_DRIVER == DISPLAY_DRIVER_NEXTION)
-using FaceDisplay = NextionDisplay;
-#elif DISPLAY_ENABLE
-using FaceDisplay = RadioDisplay;
-#endif
+#include "FaceDisplay.h"
 #include "freertos/stream_buffer.h"
 
 // ============================================================================
@@ -177,23 +171,24 @@ public:
             handler_.syncRf();                      // fait aussi tune + filtres + puissance
         }
 
-#if TNC_ENABLE
-        // 8) TNC AX.25 / AFSK 1200 pour le canal donnees "APRS".
-#if APRS_GPS_ENABLE
-        gps_.begin();
-#endif
-        tncSetup();
-        tncReconcile();
-#endif
-
 #if DISPLAY_ENABLE
-        // 9) Ecran de facade (ILI9225/MCP23017 ou Nextion/UART, cf DISPLAY_DRIVER).
-        // Demarrage DIFFERE (voir poll()) : l'init de l'ecran et le trafic de sa
-        // tache ne doivent pas concurrencer la publication du service SDP
-        // pendant l'appairage.
+        // 8) Ecran de facade : DETECTION du type d'ecran (ILI9225 / Nextion /
+        //    aucun) AVANT le GPS -> le GPS choisit son port selon le resultat
+        //    (un Nextion occupe Serial1). Le PILOTE lui-meme demarre plus tard,
+        //    en differe (poll()), pour ne pas gener la publication du SDP.
 #if DISPLAY_SPECTRUM
         display_.setPcmSource([this](int16_t* out) { audio_.copySpectrumPcm(out); });
 #endif
+        display_.detect();
+#endif
+
+#if TNC_ENABLE
+        // 9) TNC AX.25 / AFSK 1200 pour le canal donnees "APRS".
+#if APRS_GPS_ENABLE
+        gps_.begin();   // toujours SoftwareSerial (cf GpsNmea.h)
+#endif
+        tncSetup();
+        tncReconcile();
 #endif
         return true;
     }
@@ -279,7 +274,7 @@ public:
             Serial.printf("[SPP-DUAL] demarrage ecran (tas libre %u o, SDP=%s)\n",
                           (unsigned)ESP.getFreeHeap(),
                           vendorSdpHandle_ ? "ok" : "absent");
-            display_.begin();
+            display_.start();
         }
         if (displayStarted_) feedDisplay();
 #endif

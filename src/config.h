@@ -468,11 +468,13 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // GPS NMEA -> balise "tracker" (position dynamique) + synchro affichée sur
 // l'écran de façade. Repli sur la position fixe tant qu'il n'y a pas de fix
 // valide (< APRS_GPS_FIX_MAX_AGE_S).
-// Serial1 sur un GPIO LIBRE (pas ceux de kv4p-ht). GPIO4 = libre en brochage
-// kv4p-ht v1 (attention : v2.0c/d y met le squelch).
+// Le GPS est TOUJOURS lu sur un UART LOGICIEL (SoftwareSerial, RX seul), quel
+// que soit l'écran : les 3 UART matériels sont pris (USB debug + SA818 +
+// éventuel Nextion). NMEA a un checksum -> une trame perdue est simplement
+// ignorée. GPIO 4 = libre dans tous les modes (bit-bang ILI9225 seulement,
+// et le Nextion est sur 21/22).
 #define APRS_GPS_ENABLE           true
-#define APRS_GPS_RX_GPIO          4                  // RX de l'ESP  <- TX du GPS
-#define APRS_GPS_TX_GPIO         (-1)                // inutile (on n'écrit pas vers le GPS)
+#define APRS_GPS_RX_GPIO          4                  // RX de l'ESP  <- TX du GPS (SoftwareSerial)
 #define APRS_GPS_BAUD             9600
 #define APRS_GPS_FIX_MAX_AGE_S    30                 // au-delà, on considère le fix perdu
 
@@ -490,18 +492,24 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define DISPLAY_ENABLE            true
 
 // --- Choix du pilote d'écran ---------------------------------------------
-#define DISPLAY_DRIVER_ILI9225   0   // TFT ILI9225 176x220 via MCP23017 (SPI)
-#define DISPLAY_DRIVER_NEXTION   1   // écran "intelligent" Nextion (UART)
-#define DISPLAY_DRIVER           DISPLAY_DRIVER_NEXTION
+#define DISPLAY_DRIVER_ILI9225   0   // force le pilote ILI9225 (MCP23017 / SPI)
+#define DISPLAY_DRIVER_NEXTION   1   // force le pilote Nextion (UART)
+#define DISPLAY_DRIVER_AUTO      2   // DÉTECTION AUTOMATIQUE au démarrage :
+                                     //   MCP23017 vu sur l'I2C   -> ILI9225
+                                     //   "comok" sur l'UART      -> Nextion
+                                     //   ni l'un ni l'autre      -> aucun pilote
+#define DISPLAY_DRIVER           DISPLAY_DRIVER_AUTO
+
+// Quels pilotes sont COMPILÉS (en AUTO : les deux).
+#define DISPLAY_HAS_ILI9225  (DISPLAY_ENABLE && DISPLAY_DRIVER != DISPLAY_DRIVER_NEXTION)
+#define DISPLAY_HAS_NEXTION  (DISPLAY_ENABLE && DISPLAY_DRIVER != DISPLAY_DRIVER_ILI9225)
 
 // --- Nextion NX4827T043 (480x272, UART ; adaptation 5V<->3,3V externe) ---
-// L'ESP32 n'a que 3 UART : USB(debug) + SA818(Serial2) + GPS(Serial1). Le
-// Nextion prend donc Serial1 ; si le GPS est actif il bascule sur un UART
-// LOGICIEL (SoftwareSerial, RX seul) -> voir NEXTION_GPS_SOFT_RX_GPIO.
-#define NEXTION_RX_GPIO          4      // ESP RX  <- TX du Nextion (ancienne broche GPS)
-#define NEXTION_TX_GPIO          21     // ESP TX  -> RX du Nextion (ex-I2C, libre sans MCP)
+// Le Nextion utilise Serial1 (matériel) sur GPIO 21/22 (libres quand il n'y a
+// pas de MCP23017). Le GPS reste sur SoftwareSerial/GPIO 4, indépendant.
+#define NEXTION_RX_GPIO          22     // ESP RX  <- TX du Nextion
+#define NEXTION_TX_GPIO          21     // ESP TX  -> RX du Nextion
 #define NEXTION_BAUD             115200 // débit UART ; l'écran doit être réglé pareil (bauds=)
-#define NEXTION_GPS_SOFT_RX_GPIO 22     // GPS sur SoftwareSerial quand le Nextion est actif
 #define NEXTION_SPECTRUM_MS      150    // cadence d'envoi du spectre (waveform)
 // Composant Waveform "sSpec" de l'interface .HMI (voir nextion/). L'ID est
 // attribué par le Nextion Editor selon l'ordre de création : à relever dans

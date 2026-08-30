@@ -236,33 +236,42 @@ adaptateur serve aux deux projets.
 | **PD module RF** | **19** | `PIN_PD` | Alimentation du module SA818 (HIGH = allumé). `-1` si non câblé. Inutile en mode UV-K1. |
 | PTT local (option) | `-1` | `PIN_PHYS_PTT1/2` (5 / 33) | Force la capture ADC → HTCommander comme si le squelch était ouvert. |
 | LED d'état (option) | `-1` | `PIN_LED` (2) | Fixe en émission, clignote en réception. |
-| **GPS NMEA** | **4** | — | RX de l'ESP ← TX du GPS, `Serial1` @ 9600 (`APRS_GPS_*`). GPIO4 libre en brochage kv4p-ht v1 (v2.0c/d y met le squelch). Alimente la balise « tracker » + la synchro GPS de l'écran. |
+| **GPS NMEA** | **4** | — | RX de l'ESP ← TX du GPS, **`SoftwareSerial`** RX seul @ 9600 (`APRS_GPS_*`). GPIO4 libre en brochage kv4p-ht v1 (v2.0c/d y met le squelch). Alimente la balise « tracker » + la synchro GPS de l'écran. |
 | **Écran / MCP23017** | **21 / 22** | — | Bus I2C (`DISPLAY_I2C_SDA` / `SCL`) vers l'expandeur MCP23017 (`MCP23017_ADDR` 0x20). |
 
 ### Écran de façade « portatif VHF »
 
-Deux pilotes au choix via **`DISPLAY_DRIVER`** dans `config.h` :
+Réglage **`DISPLAY_DRIVER`** dans `config.h` :
 
-| `DISPLAY_DRIVER` | Écran | Transport | Notes |
-|---|---|---|---|
-| `DISPLAY_DRIVER_ILI9225` | TFT ILI9225 176×220 | SPI matériel + MCP23017 (I2C) pour CS/RS/RST/LED | rendu maison, voir plus bas |
-| `DISPLAY_DRIVER_NEXTION` | Nextion NX4827T043 (480×272) | UART (`Serial1`) | rendu par l'écran ; le GPS bascule sur `SoftwareSerial` |
+| `DISPLAY_DRIVER` | Comportement |
+|---|---|
+| `DISPLAY_DRIVER_AUTO` *(défaut)* | **détection au démarrage** : MCP23017 qui répond sur l'I2C → ILI9225 ; sinon `comok` reçu sur l'UART → Nextion ; sinon **aucun pilote** (0 octet de RAM) |
+| `DISPLAY_DRIVER_ILI9225` | force le pilote ILI9225 (MCP23017 / SPI) |
+| `DISPLAY_DRIVER_NEXTION` | force le pilote Nextion (UART) |
 
-Dans les deux cas l'affichage est **passif** (lecture seule) et démarre en
-**différé** (après publication du service SDP) pour ne pas gêner l'appairage.
+En `AUTO` les deux pilotes sont compilés ; **un seul** (le détecté) est alloué,
+sur le tas, au démarrage différé — « pas d'écran » ne coûte donc rien.
+
+Dans tous les cas l'affichage est **passif** (lecture seule) et le pilote
+démarre en **différé** (après publication du service SDP) pour ne pas gêner
+l'appairage.
+
+**GPS** : toujours lu sur un **UART logiciel** (`SoftwareSerial`, RX seul) sur
+`APRS_GPS_RX_GPIO` (**GPIO 4**), quel que soit l'écran — les 3 UART matériels
+sont pris (USB debug + SA818 sur `Serial2` + éventuel Nextion sur `Serial1`).
+D'où la dépendance `EspSoftwareSerial`. Le checksum NMEA est vérifié : une
+trame perdue (charge d'interruptions Bluetooth) est ignorée.
 
 #### Nextion NX4827T043
 
-L'ESP n'a que 3 UART (USB debug + SA818 sur `Serial2` + GPS sur `Serial1`) :
-le Nextion prend **`Serial1`** et le GPS passe alors sur un **UART logiciel**
-(`SoftwareSerial`, RX seul) — d'où la dépendance `EspSoftwareSerial`.
+Le Nextion utilise **`Serial1`** (matériel) sur GPIO 21/22, libres quand il
+n'y a pas de MCP23017.
 
 | Nextion | Vers | `config.h` |
 |---|---|---|
-| TX | `NEXTION_RX_GPIO` (**4**) de l'ESP | `NEXTION_RX_GPIO` |
-| RX | `NEXTION_TX_GPIO` (**21**) de l'ESP | `NEXTION_TX_GPIO` |
+| TX | ESP **GPIO 22** | `NEXTION_RX_GPIO` |
+| RX | ESP **GPIO 21** | `NEXTION_TX_GPIO` |
 | 5 V / GND | alim ; **adaptation de niveau 5 V ↔ 3,3 V externe** sur TX/RX | — |
-| (GPS TX) | `NEXTION_GPS_SOFT_RX_GPIO` (**22**) | — |
 
 `NEXTION_BAUD` = 115200 (le firmware tente de passer un écran neuf de 9600 à
 115200 au démarrage, `bauds=`). L'**interface `.HMI`** est à créer dans le
