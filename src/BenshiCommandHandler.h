@@ -466,6 +466,12 @@ public:
     // foi (pollRssiSa818) ; le niveau dérivé de l'ADC ne sert qu'en mode UV-K1
     // ou tant que le module n'a pas répondu.
     void setAudioRx(bool active, uint8_t rssi) {
+#if RF_MODULE_UVK5_ENABLE
+        // Mode UV-K1 piloté : is_sq / RSSI viennent du GET_STATUS série
+        // (pollUvK5), qui fait autorité. On ignore l'estimation par le niveau
+        // audio pour éviter que les deux se battent.
+        if (uvk5_) return;
+#endif
         uint8_t eff = !active ? 0
                     : (sa818RssiValid_.load() ? rssi_.load() : rssi);
         bool changed = (active != sqOpen_.load()) || (eff != rssi_.load());
