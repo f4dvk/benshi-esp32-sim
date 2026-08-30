@@ -136,11 +136,11 @@ private:
             tft_.fillRect(196, BAR_Y, 14, 16, BG);
             tft_.text(196, BAR_Y, f.highPower ? "H" : "L", f.highPower ? AMBER : SEG, BG, 2);
         }
-        if (F || f.bt != c_.bt) tft_.text(230, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 2);
+        if (F || f.bt != c_.bt) tft_.text(220, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 2);
         if (F || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
-            if (f.gpsFix >= 2) snprintf(b, sizeof(b), "%uD%02u", f.gpsFix, f.gpsSats);
-            else               snprintf(b, sizeof(b), "--");
-            tft_.fillRect(266, BAR_Y, W - 266, 16, BG);
+            if (f.gpsFix >= 2) snprintf(b, sizeof(b), "%uD %02u", f.gpsFix, f.gpsSats);
+            else               snprintf(b, sizeof(b), "-- --");
+            tft_.fillRect(252, BAR_Y, W - 252, 16, BG);
             tft_.textRight(W - 3, BAR_Y, b, f.gpsFix >= 2 ? OKG : DIM, BG, 2);
         }
 

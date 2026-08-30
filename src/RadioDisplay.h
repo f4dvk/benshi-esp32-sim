@@ -209,9 +209,9 @@ private:
             tft_.text(158, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 1);
         if (F || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
             char s[10];
-            if (f.gpsFix >= 2) snprintf(s, sizeof(s), "%uD%02u", f.gpsFix, f.gpsSats);
-            else               snprintf(s, sizeof(s), "--");
-            tft_.fillRect(184, BAR_Y, W - 184, 8, BG);
+            if (f.gpsFix >= 2) snprintf(s, sizeof(s), "%uD %02u", f.gpsFix, f.gpsSats);
+            else               snprintf(s, sizeof(s), "-- --");
+            tft_.fillRect(180, BAR_Y, W - 180, 8, BG);
             tft_.textRight(W - 2, BAR_Y, s, f.gpsFix >= 2 ? OKG : DIM, BG, 1);
         }
 
