@@ -289,6 +289,16 @@ public:
         aprsBeaconChannelRestore();
 #if APRS_GPS_ENABLE
         handler_.setGpsLocked(gps_.hasFix());   // -> is_gps_locked du HT_STATUS (HTCommander)
+        // Position -> carte HTCommander : rafraîchie régulièrement (indépendante
+        // de l'intervalle de balise APRS), sinon il ne reçoit un point que
+        // toutes les ~2 min et affiche "non lock".
+        if (handler_.positionShareWanted() && millis() - lastPosEmitMs_ > 3000) {
+            double la, lo;
+            if (gps_.fix(la, lo)) {
+                handler_.emitPositionChanged(AprsConfig::degToRaw(la), AprsConfig::degToRaw(lo));
+                lastPosEmitMs_ = millis();
+            }
+        }
 #endif
 #endif
 #if DISPLAY_ENABLE
@@ -849,6 +859,7 @@ private:
     bool dataChanActive_ = false;                // radio sur le canal "APRS"
     uint32_t connUpSinceMs_ = 0;                 // date où COMMANDE+AUDIO tous deux mappés
     uint32_t lastBeaconMs_ = 0;                  // dernière balise APRS autonome
+    uint32_t lastPosEmitMs_ = 0;                 // dernière notif POSITION_CHANGE
     uint32_t beaconQueuedMs_ = 0;                // -> label "TX APRS" sur l'ecran
     uint8_t  beaconRestoreCh_ = 0xFF;            // canal à restaurer après balise (0xFF = rien)
     uint8_t  beaconDispCh_ = 0xFF;               // canal réellement utilisé pour la balise (écran)

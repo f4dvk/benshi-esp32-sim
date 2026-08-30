@@ -22,6 +22,10 @@
 class GpsNmea {
 public:
     void begin() {
+        // Gros tampon RX : la boucle Arduino (poll) peut être retardée >250 ms
+        // par la tâche d'affichage / le TNC -> sinon le FIFO de 256 o déborde
+        // et ~60 % des trames NMEA échouent au checksum.
+        Serial1.setRxBufferSize(1024);
         Serial1.begin(APRS_GPS_BAUD, SERIAL_8N1, APRS_GPS_RX_GPIO, -1);
         Serial.printf("[GPS] NMEA sur Serial1 RX=GPIO%d @ %d bauds\n",
                       APRS_GPS_RX_GPIO, APRS_GPS_BAUD);
@@ -30,6 +34,7 @@ public:
     void poll() {
         while (Serial1.available()) {
             char c = (char)Serial1.read();
+            rxBytes_++;
             if (c == '\n' || c == '\r') {
                 if (len_ > 6) parseLine();
                 len_ = 0;
@@ -39,6 +44,20 @@ public:
                 len_ = 0;   // ligne trop longue -> on jette
             }
         }
+#if AUDIO_DEBUG
+        uint32_t now = millis();
+        if (now - lastLogMs_ >= 3000) {
+            lastLogMs_ = now;
+            uint32_t age = haveFix_ ? (now - fixMs_) / 1000 : 999;
+            Serial.printf("[GPS] rx=%luo/3s trames ok=%lu bad=%lu | dernier %s val=%c | "
+                          "fix=%d (age %lus) sats=%u type=%uD utc=%d -> lock=%d\n",
+                          (unsigned long)rxBytes_, (unsigned long)sentOk_,
+                          (unsigned long)sentBad_, lastType_[0] ? lastType_ : "-",
+                          lastRmcV_ ? lastRmcV_ : '?', (int)haveFix_, (unsigned long)age,
+                          sats_, fixType_, (int)haveUtc_, (int)hasFix());
+            rxBytes_ = sentOk_ = sentBad_ = 0;
+        }
+#endif
     }
 
     // Renvoie true si un fix valide date de moins de APRS_GPS_FIX_MAX_AGE_S.
@@ -91,9 +110,11 @@ private:
         if (star && star[1] && star[2]) {
             uint8_t cs = 0;
             for (char* p = line_ + 1; p < star; p++) cs ^= (uint8_t)*p;
-            if (cs != (uint8_t)strtol(star + 1, nullptr, 16)) return;
+            if (cs != (uint8_t)strtol(star + 1, nullptr, 16)) { sentBad_++; return; }
             *star = '\0';
         }
+        sentOk_++;
+        strlcpy(lastType_, line_ + 1, sizeof(lastType_));
         // type = 3 lettres après le "talker" (ex. GPRMC, GNRMC) -> line_[3..5]
         const char* t = line_ + 3;
         char* f[20];
@@ -102,6 +123,7 @@ private:
         if (!strncmp(t, "RMC", 3) && nf >= 7) {
             parseUtc(f[1]);
             bool valid = (f[2][0] == 'A');
+            lastRmcV_ = f[2][0] ? f[2][0] : 'V';
             double lat = nmeaToDeg(f[3], f[4]);
             double lon = nmeaToDeg(f[5], f[6]);
             if (valid && !isnan(lat) && !isnan(lon)) store(lat, lon);
@@ -145,6 +167,10 @@ private:
     bool     haveFix_ = false;
     uint8_t  sats_ = 0;
     uint8_t  fixType_ = 0;
+    // --- diagnostic ---
+    uint32_t rxBytes_ = 0, sentOk_ = 0, sentBad_ = 0, lastLogMs_ = 0;
+    char     lastType_[8] = {0};
+    char     lastRmcV_ = 0;
     uint8_t  utcH_ = 0, utcM_ = 0, utcS_ = 0;
     uint32_t utcMs_ = 0;
     bool     haveUtc_ = false;
