@@ -8,11 +8,8 @@
 // ============================================================================
 // Lecteur NMEA minimal pour balise APRS "tracker" (position dynamique).
 //
-// Analyse $--RMC (position + validité) et $--GGA (position). Le GPS est
-// TOUJOURS lu sur un UART LOGICIEL (SoftwareSerial, RX seul) sur
-// APRS_GPS_RX_GPIO : les 3 UART matériels de l'ESP32 sont pris (USB debug +
-// SA818 + éventuel Nextion). Le checksum NMEA est vérifié -> une trame perdue
-// (charge d'interruptions Bluetooth) est simplement ignorée.
+// Analyse $--RMC (position + validité) et $--GGA (position) sur Serial1
+// (UART1 matériel, RX seul, APRS_GPS_RX_GPIO). Le checksum NMEA est vérifié.
 //
 //   gps.begin();                 // dans setup()
 //   gps.poll();                  // souvent (boucle Arduino)
@@ -22,22 +19,17 @@
 
 #if APRS_GPS_ENABLE
 
-#include <SoftwareSerial.h>
-
 class GpsNmea {
 public:
     void begin() {
-        // Gros tampon RX (256 o ~ 260 ms @ 9600) : encaisse une boucle Arduino
-        // ralentie par la tâche d'affichage sans perdre de trames.
-        ss_.begin(APRS_GPS_BAUD, SWSERIAL_8N1, APRS_GPS_RX_GPIO, -1, false, 256);
-        ser_ = &ss_;
-        Serial.printf("[GPS] NMEA sur SoftwareSerial RX=GPIO%d @ %d bauds\n",
+        Serial1.begin(APRS_GPS_BAUD, SERIAL_8N1, APRS_GPS_RX_GPIO, -1);
+        Serial.printf("[GPS] NMEA sur Serial1 RX=GPIO%d @ %d bauds\n",
                       APRS_GPS_RX_GPIO, APRS_GPS_BAUD);
     }
 
     void poll() {
-        while (ser_ && ser_->available()) {
-            char c = (char)ser_->read();
+        while (Serial1.available()) {
+            char c = (char)Serial1.read();
             if (c == '\n' || c == '\r') {
                 if (len_ > 6) parseLine();
                 len_ = 0;
@@ -94,8 +86,7 @@ private:
 
     void parseLine() {
         if (line_[0] != '$') return;
-        // Checksum NMEA "$....*HH" : indispensable sur SoftwareSerial (octets
-        // parfois perdus sous forte charge d'interruptions Bluetooth).
+        // Checksum NMEA "$....*HH" : rejette une trame corrompue.
         char* star = strchr(line_, '*');
         if (star && star[1] && star[2]) {
             uint8_t cs = 0;
@@ -147,8 +138,6 @@ private:
         haveFix_ = true;
     }
 
-    SoftwareSerial ss_;
-    Stream*  ser_ = nullptr;
     char     line_[100];
     size_t   len_ = 0;
     double   lat_ = 0, lon_ = 0;

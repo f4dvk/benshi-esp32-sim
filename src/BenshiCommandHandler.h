@@ -152,8 +152,21 @@ public:
     }
     String channelName(uint8_t id) { return state_.channelNameOf(id); }
 
+    // Demande de changement de canal (tactile de l'écran ILI9341). Appliqué
+    // depuis la boucle Arduino (pollRf) : retune + notification à HTCommander.
+    void stepChannel(int delta) { pendingChanStep_.fetch_add(delta); }
+
     // Appelé périodiquement par le transport (boucle Arduino).
     void pollRf() {
+        int step = pendingChanStep_.exchange(0);
+        if (step) {
+            int n = (int)state_.activeChannelId() + step;
+            n %= CHANNEL_COUNT; if (n < 0) n += CHANNEL_COUNT;
+            state_.setActiveChannel((uint8_t)n);
+            Serial.printf("[CMD] tactile : canal actif -> %d\n", n);
+            rfDirty_.store(true);
+            emitHtStatusChanged();
+        }
         if (rfDirty_.exchange(false)) syncRf();
         pollRssiSa818();
     }
@@ -444,6 +457,7 @@ private:
     bool     htStatusDirty_  = false;
     bool     bssDirty_       = false;
     std::atomic<bool> rfDirty_{false};   // canal actif changé -> retune module RF
+    std::atomic<int>  pendingChanStep_{0};   // pas de canal demandé par le tactile
 
     std::atomic<bool>    sqOpen_{false};
     std::atomic<uint8_t> rssi_{0};

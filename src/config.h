@@ -467,94 +467,72 @@ static const uint8_t  DEFAULT_REGION      = 0;
 
 // GPS NMEA -> balise "tracker" (position dynamique) + synchro affichée sur
 // l'écran de façade. Repli sur la position fixe tant qu'il n'y a pas de fix
-// valide (< APRS_GPS_FIX_MAX_AGE_S).
-// Le GPS est TOUJOURS lu sur un UART LOGICIEL (SoftwareSerial, RX seul), quel
-// que soit l'écran : les 3 UART matériels sont pris (USB debug + SA818 +
-// éventuel Nextion). NMEA a un checksum -> une trame perdue est simplement
-// ignorée. GPIO 4 = libre dans tous les modes (bit-bang ILI9225 seulement,
-// et le Nextion est sur 21/22).
+// valide (< APRS_GPS_FIX_MAX_AGE_S). Lu sur Serial1 matériel (RX seul).
 #define APRS_GPS_ENABLE           true
-#define APRS_GPS_RX_GPIO          4                  // RX de l'ESP  <- TX du GPS (SoftwareSerial)
+#define APRS_GPS_RX_GPIO          4                  // Serial1 RX <- TX du GPS
 #define APRS_GPS_BAUD             9600
 #define APRS_GPS_FIX_MAX_AGE_S    30                 // au-delà, on considère le fix perdu
 
 // ----------------------------------------------------------------------
-// 7bis) Écran de façade "portatif VHF" : ILI9225 câblé sur un expandeur
-//       GPIO MCP23017 (I2C). L'affichage est PASSIF (lecture seule) :
-//       fréquence, canal, RSSI (S-mètre), puissance, squelch, synchro GPS.
-//
-// L'écran est piloté en SPI LOGICIEL bit-bangé À TRAVERS le MCP23017 : chaque
-// octet = plusieurs transactions I2C -> l'affichage est LENT (redessin d'un
-// champ ~1 s, écran complet ~30 s au boot). Acceptable pour un tableau de bord.
-// Une tâche FreeRTOS dédiée (priorité basse) s'en charge sans gêner l'audio /
-// le Bluetooth.
+// 7bis) Écran de façade "portatif VHF" — raccordé DIRECTEMENT sur le SPI de
+//       l'ESP (plus de MCP23017). Deux familles, un seul écran à la fois :
+//         - ILI9225 176x220 (passif)
+//         - ILI9341 320x240 (+ tactile résistif XPT2046, auto-désactivé absent)
+//       Détection au démarrage par lecture de l'ID sur le bus SPI (-> MISO
+//       OBLIGATOIRE). Câblage identique pour les deux.
 // ----------------------------------------------------------------------
 #define DISPLAY_ENABLE            true
 
-// --- Choix du pilote d'écran ---------------------------------------------
-#define DISPLAY_DRIVER_ILI9225   0   // force le pilote ILI9225 (MCP23017 / SPI)
-#define DISPLAY_DRIVER_NEXTION   1   // force le pilote Nextion (UART)
-#define DISPLAY_DRIVER_AUTO      2   // DÉTECTION AUTOMATIQUE au démarrage :
-                                     //   MCP23017 vu sur l'I2C   -> ILI9225
-                                     //   "comok" sur l'UART      -> Nextion
-                                     //   ni l'un ni l'autre      -> aucun pilote
+#define DISPLAY_DRIVER_ILI9225   0   // force le pilote ILI9225
+#define DISPLAY_DRIVER_ILI9341   1   // force le pilote ILI9341 (+ tactile)
+#define DISPLAY_DRIVER_AUTO      2   // détection : ID 0x9341 -> ILI9341 ;
+                                     //   ID 0x9225 -> ILI9225 ; rien -> aucun
 #define DISPLAY_DRIVER           DISPLAY_DRIVER_AUTO
+// BEAUCOUP de modules ILI9225 SPI n'ont PAS de broche MISO/SDO -> impossible
+// de lire leur ID. Par défaut, en AUTO, tout écran qui n'est pas un ILI9341
+// est donc supposé être un ILI9225. Mettre à false pour une détection stricte
+// (ID 0x9225 obligatoire) si tu veux vraiment "aucun pilote sans écran"
+// -- dans ce cas un ILI9225 sans SDO doit être forcé (DISPLAY_DRIVER_ILI9225).
+#define DISPLAY_AUTO_FALLBACK_ILI9225  true
 
-// Quels pilotes sont COMPILÉS (en AUTO : les deux).
-#define DISPLAY_HAS_ILI9225  (DISPLAY_ENABLE && DISPLAY_DRIVER != DISPLAY_DRIVER_NEXTION)
-#define DISPLAY_HAS_NEXTION  (DISPLAY_ENABLE && DISPLAY_DRIVER != DISPLAY_DRIVER_ILI9225)
+// Pilotes COMPILÉS (en AUTO : les deux).
+#define DISPLAY_HAS_ILI9225  (DISPLAY_ENABLE && DISPLAY_DRIVER != DISPLAY_DRIVER_ILI9341)
+#define DISPLAY_HAS_ILI9341  (DISPLAY_ENABLE && DISPLAY_DRIVER != DISPLAY_DRIVER_ILI9225)
 
-// --- Nextion NX4827T043 (480x272, UART ; adaptation 5V<->3,3V externe) ---
-// Le Nextion utilise Serial1 (matériel) sur GPIO 21/22 (libres quand il n'y a
-// pas de MCP23017). Le GPS reste sur SoftwareSerial/GPIO 4, indépendant.
-#define NEXTION_RX_GPIO          22     // ESP RX  <- TX du Nextion
-#define NEXTION_TX_GPIO          21     // ESP TX  -> RX du Nextion
-#define NEXTION_BAUD             115200 // débit UART ; l'écran doit être réglé pareil (bauds=)
-#define NEXTION_SPECTRUM_MS      150    // cadence d'envoi du spectre (waveform)
-// Composant Waveform "sSpec" de l'interface .HMI (voir nextion/). L'ID est
-// attribué par le Nextion Editor selon l'ordre de création : à relever dans
-// l'éditeur (panneau d'attributs -> id) et à reporter ici.
-#define NEXTION_WAVE_ID          10     // .id du composant sSpec
-#define NEXTION_WAVE_W           272    // largeur de sSpec en pixels (= nb de points envoyés)
-#define NEXTION_WAVE_H           64     // hauteur de sSpec en pixels
+// --- Bus SPI de l'écran (commun ILI9225 / ILI9341) ---
+#define DISPLAY_SPI_SCK          14
+#define DISPLAY_SPI_MOSI         13
+#define DISPLAY_SPI_MISO         35   // entrée seule ; REQUIS pour la détection auto (+ tactile)
+#define DISPLAY_CS_PIN           27
+#define DISPLAY_DC_PIN           33   // = RS
+#define DISPLAY_RST_PIN          22   // -1 = câblé sur EN / 3,3 V + RC
+#define DISPLAY_LED_PIN         (-1)  // -1 = câblé sur 3,3 V ; sinon GPIO (PWM possible)
 
-#define DISPLAY_I2C_SDA           21
-#define DISPLAY_I2C_SCL           22
-#define DISPLAY_I2C_FREQ          1000000            // MCP23017 tient 1,7 MHz ; 800000 / 400000 si l'I2C n'est pas fiable
-#define MCP23017_ADDR            0x20                // A0..A2 à la masse
-// Broches de l'ILI9225 sur le MCP23017 : 0..7 = GPA0..7, 8..15 = GPB0..7.
-// EN BIT-BANG (ILI9225_HW_SPI=false), SCK et SDI DOIVENT être sur le port A.
-// EN SPI MATÉRIEL (true), CLK/SDA sont sur l'ESP (ILI9225_SPI_*) et le MCP ne
-// porte plus que CS/RS/RST/LED -> ici sur le PORT B (GPB0..3).
-#define ILI9225_CS_PIN           8                   // GPB0  -> /CS
-#define ILI9225_RST_PIN          9                   // GPB1  -> /RST
-#define ILI9225_RS_PIN           10                  // GPB2  -> RS / DC
-#define ILI9225_LED_PIN          11                  // GPB3  -> rétro-éclairage (-1 = câblé en dur)
-#define ILI9225_SDI_PIN          3                   // (bit-bang seulement : GPA3 -> SDA)
-#define ILI9225_SCK_PIN          4                   // (bit-bang seulement : GPA4 -> CLK)
-#define ILI9225_LED_ON_LEVEL     1                   // 1 = niveau HAUT allume le rétro-éclairage, 0 = niveau BAS
-#define ILI9225_ROTATION         1                   // 0..3 (1 = paysage 220x176)
-#define ILI9225_INVERT           false               // true si les couleurs sont inversées
-// ACCÉLÉRATION : câbler SCK + SDA en DIRECT sur 2 GPIO de l'ESP (SPI matériel)
-// et ne laisser que CS/RS/RST/LED sur le MCP23017 -> affichage ~50x plus rapide.
-// Il faut alors débrancher CLK et SDA du MCP et les mettre sur ILI9225_SPI_SCK /
-// _MOSI. CS/RS/RST/LED restent sur le MCP (ILI9225_*_PIN ci-dessus).
-#define ILI9225_HW_SPI           true
-#define ILI9225_SPI_SCK          14                  // GPIO ESP32 <- CLK de l'ecran
-#define ILI9225_SPI_MOSI         13                  // GPIO ESP32 <- SDA de l'ecran
-#define ILI9225_SPI_HZ           26670000            // 26,67 MHz (80/3) ; baisser si l'affichage bruite
-// RS/DC sur un GPIO DE L'ESP plutôt que sur le MCP23017 : -1 = laissé sur le
-// MCP (via I2C, lent) ; un n° de GPIO = câbler RS dessus -> chaque fenêtre GRAM
-// coûte 2 transactions I2C au lieu de ~14 => balayage plusieurs fois plus
-// rapide. C'est LE levier de vitesse (1 seul fil à ajouter).
-#define ILI9225_SPI_RS           (-1)                // ex. 27 pour câbler RS sur GPIO27
-#define DISPLAY_FULL_CLEAR       true                // false : ne pas remplir le fond en noir (~10 s gagnées au boot, mais bruit entre les zones)
-#define DISPLAY_REFRESH_MS       130                 // cadence de la tâche d'affichage (ne redessine QUE ce qui change)
+#define ILI9225_SPI_HZ           20000000   // monter jusqu'à ~33 MHz si le câblage est court/propre
+#define ILI9225_ROTATION         1    // 0..3 ; 1 = paysage 220x176
+#define ILI9225_INVERT           false
+
+#define ILI9341_SPI_HZ           40000000
+#define ILI9341_ROTATION         1    // 0..3 ; 1 = paysage 320x240
+#define ILI9341_INVERT           false
+
+// --- Tactile XPT2046 (ILI9341 uniquement, même bus SPI) ---
+#define TOUCH_ENABLE             true                // auto-désactivé si la puce ne répond pas
+#define TOUCH_CS_PIN             21
+#define TOUCH_IRQ_PIN            36                  // entrée seule ; -1 = interrogation sans IRQ
+#define TOUCH_SPI_HZ             2000000
+#define TOUCH_TAP_MAX_MS         600                 // tap gauche/droite = canal -1 / +1
+#define TOUCH_CAL_X0             300                 // étalonnage : brut aux bords (0..4095)
+#define TOUCH_CAL_X1             3800
+#define TOUCH_CAL_Y0             300
+#define TOUCH_CAL_Y1             3800
+
+#define DISPLAY_FULL_CLEAR       true
+#define DISPLAY_REFRESH_MS       130                 // cadence de la tâche d'affichage
 #define DISPLAY_SPECTRUM         true                // analyseur de spectre de l'audio reçu (FFT 256 pts)
-#define DISPLAY_SPECTRUM_MS      130                 // cadence de rafraîchissement du spectre
-// L'écran démarre APRÈS le Bluetooth : l'init I2C + le trafic de la tâche
-// d'affichage ne doivent pas concurrencer la publication du service SDP
-// (sinon HTCommander ne voit pas la radio et l'appairage traîne).
+#define DISPLAY_SPECTRUM_MS      130
+// L'écran démarre APRÈS le Bluetooth (publication du service SDP) pour ne pas
+// ralentir l'appairage.
 #define DISPLAY_START_DELAY_MS   6000
 
 // ----------------------------------------------------------------------

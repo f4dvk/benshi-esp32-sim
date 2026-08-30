@@ -1,22 +1,19 @@
 #pragma once
 #include <Arduino.h>
-#include <Wire.h>
 #include "config.h"
 
 #if DISPLAY_HAS_ILI9225
 
 #include <functional>
 #include "RadioFace.h"
-#include "Mcp23017.h"
 #include "Ili9225.h"
 #include "AudioSpectrum.h"
 
 // ============================================================================
-// Écran de façade "portatif VHF", look Icom (ILI9225 / MCP23017).
+// Écran de façade "portatif VHF", look Icom (ILI9225, SPI direct).
 //
-// Affichage passif. Le transport SPI (bit-bangé via I2C, OU matériel si
-// ILI9225_HW_SPI) est lent -> on ne redessine QUE ce qui change, au segment /
-// au caractère près. Tâche FreeRTOS dédiée, priorité basse.
+// Affichage passif, rendu delta (seuls les champs qui changent sont retracés).
+// Tâche FreeRTOS dédiée, priorité basse.
 // ============================================================================
 
 class RadioDisplay {
@@ -26,30 +23,13 @@ public:
     using PcmSource = std::function<void(int16_t*)>;
     void setPcmSource(PcmSource fn) { pcm_ = std::move(fn); }
 
-    bool begin() {
-        uint32_t freeHeap = ESP.getFreeHeap();
-        if (freeHeap < 30000) {
-            Serial.printf("[DISP] tas trop juste (%u o) -> ecran non demarre\n", (unsigned)freeHeap);
+    bool begin(SPIClass* spi) {
+        if (ESP.getFreeHeap() < 20000) {
+            Serial.println("[DISP] tas trop juste -> ecran non demarre");
             return false;
         }
         mtx_ = xSemaphoreCreateMutex();
-        Wire.begin(DISPLAY_I2C_SDA, DISPLAY_I2C_SCL, DISPLAY_I2C_FREQ);
-        // En SPI matériel, seules les lignes de contrôle passent par l'I2C
-        // (1 octet) : le gros tampon n'est utile qu'en bit-bang.
-#if ILI9225_HW_SPI
-        size_t wb = Wire.setBufferSize(128);
-#else
-        size_t wb = Wire.setBufferSize(Mcp23017::kWireBuf + 8);
-#endif
-        Serial.printf("[DISP] tampon I2C = %u o, tas libre %u o\n",
-                      (unsigned)wb, (unsigned)freeHeap);
-        if (!mcp_.begin(Wire, MCP23017_ADDR, wb)) {
-            Serial.printf("[DISP] MCP23017 absent (0x%02X) -> ecran desactive\n", MCP23017_ADDR);
-            return false;
-        }
-        Serial.printf("[DISP] MCP23017 OK  IOCON=0x%02X IODIRA=0x%02X\n",
-                      mcp_.readReg(Mcp23017::REG_IOCON), mcp_.readReg(Mcp23017::REG_IODIRA));
-        tft_.begin(mcp_);
+        tft_.begin(spi);
         xTaskCreatePinnedToCore(&RadioDisplay::trampoline, "display", 4096, this, 1, nullptr, 1);
         return true;
     }
@@ -101,6 +81,7 @@ private:
     static const uint16_t MTRG  = 0x2FEB;   // vert S-mètre Icom
     static const uint16_t OKG   = 0x07E6;
     static const uint16_t DIM   = 0x39E7;
+    static const uint16_t BT_ON = 0x057F;   // bleu (BT connecté à HTCommander)
 
     // ---- géométrie (220 x 176, tout vérifié sans chevauchement) -----
     static const int W = 220, H = 176;
@@ -128,7 +109,7 @@ private:
     static const int SP_BARS = 24, SP_MAXBIN = 24;   // 24 points -> ~3 kHz @ 32 kHz
     static const uint32_t SPEC_IDLE_CLEAR_MS = 2500; // efface le spectre N ms après la perte du signal
     static const int SEP3  = 141;
-    static const int ST_Y  = 144, ST_BOX_W = 112, ST_BOX_H = 28;
+    static const int ST_Y  = 144, ST_BOX_W = 70, ST_BOX_H = 28;   // réduit pour loger l'indicatif
 
     int digX(int i)  const { return FX0 + i * (FDW + FGAP) + (i >= 3 ? DOTGAP : 0); }
     int dotX()       const { return digX(2) + FDW + 3; }
@@ -210,19 +191,27 @@ private:
     void render(const RadioFace& f) {
         bool F = first_;
 
-        // ---- barre haute ----
+        // ---- barre haute : n° canal + nom | shift | puissance | BT | GPS ----
         if (F || f.channelId != c_.channelId || strcmp(f.channel, c_.channel)) {
-            char s[24]; snprintf(s, sizeof(s), "M%02u %s", f.channelId, f.channel);
-            tft_.fillRect(0, BAR_Y, 120, 8, BG);
+            char s[16]; snprintf(s, sizeof(s), "%02u %s", f.channelId, f.channel);
+            tft_.fillRect(0, BAR_Y, 88, 8, BG);
             tft_.text(4, BAR_Y, s, AMBER, BG, 1);
         }
+        if (F || f.shift != c_.shift) {
+            tft_.fillRect(92, BAR_Y, 8, 8, BG);
+            tft_.text(92, BAR_Y, f.shift > 0 ? "+" : (f.shift < 0 ? "-" : ""), C_WHITE, BG, 1);
+        }
+        if (F || f.highPower != c_.highPower) {
+            tft_.fillRect(106, BAR_Y, 8, 8, BG);
+            tft_.text(106, BAR_Y, f.highPower ? "H" : "L", f.highPower ? AMBER : C_WHITE, BG, 1);
+        }
         if (F || f.bt != c_.bt)
-            tft_.text(122, BAR_Y, "BT", f.bt ? SEG : DIM, BG, 1);
+            tft_.text(158, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 1);
         if (F || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
-            char s[14];
-            if (f.gpsFix >= 2) snprintf(s, sizeof(s), "GPS %uD %02u", f.gpsFix, f.gpsSats);
-            else               snprintf(s, sizeof(s), "GPS -- --");
-            tft_.fillRect(140, BAR_Y, W - 140, 8, BG);
+            char s[10];
+            if (f.gpsFix >= 2) snprintf(s, sizeof(s), "%uD%02u", f.gpsFix, f.gpsSats);
+            else               snprintf(s, sizeof(s), "--");
+            tft_.fillRect(184, BAR_Y, W - 184, 8, BG);
             tft_.textRight(W - 2, BAR_Y, s, f.gpsFix >= 2 ? OKG : DIM, BG, 1);
         }
 
@@ -279,28 +268,34 @@ private:
             if (!F && fill > 0) tft_.fillRect(BAR_X, BAR_Y2, fill, BAR_H, col);
         }
 
-        // ---- statut : gros bloc TX / RX ----
+        // ---- statut : bloc TX / RX (réduit) ----
         bool stChg = F || f.tx != c_.tx || f.txAprs != c_.txAprs || f.sqOpen != c_.sqOpen;
         if (stChg) {
             const char* lbl; uint16_t fg, fill;
-            if (f.tx && f.txAprs) { lbl = "TX APRS"; fg = C_WHITE; fill = REDX; }
-            else if (f.tx)        { lbl = "TX";      fg = C_WHITE; fill = REDX; }
-            else if (f.sqOpen)    { lbl = "RX";      fg = BG;      fill = OKG;  }
-            else                  { lbl = "STBY";    fg = DIM;     fill = BG;   }
+            if (f.tx && f.txAprs) { lbl = "APRS"; fg = C_WHITE; fill = REDX; }
+            else if (f.tx)        { lbl = "TX";   fg = C_WHITE; fill = REDX; }
+            else if (f.sqOpen)    { lbl = "RX";   fg = BG;      fill = OKG;  }
+            else                  { lbl = "STBY"; fg = DIM;     fill = BG;   }
             tft_.fillRect(6, ST_Y, ST_BOX_W, ST_BOX_H, fill);
             tft_.drawRect(6, ST_Y, ST_BOX_W, ST_BOX_H, fill == BG ? LINE : fill);
             int tw = tft_.textWidth(lbl, 2);
             tft_.text(6 + (ST_BOX_W - tw) / 2, ST_Y + (ST_BOX_H - 16) / 2, lbl, fg,
                       fill == BG ? BG : fill, 2);
         }
-        if (F || f.sqOpen != c_.sqOpen) {
-            tft_.fillRect(122, ST_Y + 10, 40, 16, BG);
-            tft_.text(122, ST_Y + 10, f.sqOpen ? "SQ" : "  ", f.sqOpen ? OKG : DIM, BG, 2);
+        // ---- indicatif : centré dans l'espace libre entre le bloc statut et SQ ----
+        if (F || strcmp(f.callsign, c_.callsign)) {
+            const int x0 = ST_BOX_W + 12, x1 = W - 34;      // zone libre
+            tft_.fillRect(x0, ST_Y + 8, x1 - x0, 14, BG);
+            if (f.callsign[0]) {
+                int cw = tft_.textWidth(f.callsign, 2);
+                int cx = x0 + (x1 - x0 - cw) / 2;
+                if (cx < x0) cx = x0;
+                tft_.text(cx, ST_Y + 8, f.callsign, AMBER, BG, 2);
+            }
         }
-        if (F || f.highPower != c_.highPower) {
-            tft_.fillRect(W - 44, ST_Y + 10, 44, 16, BG);
-            tft_.textRight(W - 4, ST_Y + 10, f.highPower ? "HI" : "LO",
-                           f.highPower ? AMBER : C_WHITE, BG, 2);
+        if (F || f.sqOpen != c_.sqOpen) {
+            tft_.fillRect(W - 30, ST_Y + 8, 30, 16, BG);
+            tft_.textRight(W - 4, ST_Y + 8, f.sqOpen ? "SQ" : "", f.sqOpen ? OKG : DIM, BG, 2);
         }
 
         c_ = f;
@@ -381,7 +376,6 @@ private:
     }
 #endif
 
-    Mcp23017 mcp_;
     Ili9225  tft_;
     SemaphoreHandle_t mtx_ = nullptr;
     RadioFace pending_, c_;

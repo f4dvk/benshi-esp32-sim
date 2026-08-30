@@ -125,6 +125,20 @@ public:
         return (uint8_t)((settings_[0] & 0x0F) | ((settings_[9] & 0x0F) << 4));
     }
     uint8_t doubleChannel() const { return (settings_[1] & 0x30) >> 4; } // 0=off,1=VFO A,2=VFO B
+
+    // Fixe le canal du VFO actif (A, ou B si double-veille sur B). Persiste.
+    void setActiveChannel(uint8_t id) {
+        if (id >= CHANNEL_COUNT) return;
+        bool onB = (doubleChannel() == 2);
+        if (onB) {
+            settings_[0] = (uint8_t)((settings_[0] & 0xF0) | (id & 0x0F));
+            settings_[9] = (uint8_t)((settings_[9] & 0xF0) | ((id >> 4) & 0x0F));
+        } else {
+            settings_[0] = (uint8_t)((settings_[0] & 0x0F) | ((id & 0x0F) << 4));
+            settings_[9] = (uint8_t)((settings_[9] & 0x0F) | (id & 0xF0));
+        }
+        if (nvsOk_) prefs_.putBytes("settings", settings_.data(), settings_.size());
+    }
     uint8_t squelch()       const { return settings_[1] & 0x0F; }
     uint8_t micGain()       const { return (settings_[2] & 0x0E) >> 1; }
     bool    scan()          const { return (settings_[1] & 0x80) != 0; }

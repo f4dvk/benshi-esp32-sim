@@ -172,20 +172,21 @@ public:
         }
 
 #if DISPLAY_ENABLE
-        // 8) Ecran de facade : DETECTION du type d'ecran (ILI9225 / Nextion /
-        //    aucun) AVANT le GPS -> le GPS choisit son port selon le resultat
-        //    (un Nextion occupe Serial1). Le PILOTE lui-meme demarre plus tard,
-        //    en differe (poll()), pour ne pas gener la publication du SDP.
+        // 8) Ecran de facade : DETECTION du type d'ecran (ILI9225 / ILI9341 /
+        //    aucun). Le PILOTE demarre plus tard, en differe (poll()), pour ne
+        //    pas gener la publication du service SDP pendant l'appairage.
 #if DISPLAY_SPECTRUM
         display_.setPcmSource([this](int16_t* out) { audio_.copySpectrumPcm(out); });
 #endif
+        // Tactile (ILI9341) : tap gauche/droite -> canal -1 / +1.
+        display_.setTouchAction([this](int d) { handler_.stepChannel(d); });
         display_.detect();
 #endif
 
 #if TNC_ENABLE
         // 9) TNC AX.25 / AFSK 1200 pour le canal donnees "APRS".
 #if APRS_GPS_ENABLE
-        gps_.begin();   // toujours SoftwareSerial (cf GpsNmea.h)
+        gps_.begin();
 #endif
         tncSetup();
         tncReconcile();
@@ -204,6 +205,12 @@ public:
     void sendAudioEnd() { enqueueAudio(std::vector<uint8_t>{ 0x01 }); }  // Type = AudioEnd
 
 #if DISPLAY_ENABLE
+    // Signe du décalage émission/réception : +1 (shift +), -1 (shift -), 0 (simplex).
+    static int8_t shiftOf(double txMHz, double rxMHz) {
+        double d = txMHz - rxMHz;
+        return (d > 0.0005) ? 1 : (d < -0.0005 ? -1 : 0);
+    }
+
     // Instantané pour l'écran de façade (throttlé ; le rendu est ailleurs).
     void feedDisplay() {
         uint32_t now = millis();
@@ -212,7 +219,6 @@ public:
 
         RadioState::ActiveRf rf = handler_.activeRf();
         RadioFace f;
-        f.rxMHz     = rf.rx_mhz;
         f.channelId = handler_.activeChannelId();
         strlcpy(f.channel, handler_.activeChannelName().c_str(), sizeof(f.channel));
         f.wide      = rf.wide;
@@ -220,21 +226,38 @@ public:
         f.sMeter    = (uint8_t)((handler_.rssiRaw() * 9 + 7) / 15);   // 0..15 -> 0..9
         f.sqOpen    = handler_.sqOpen();
         f.tx        = audio_.txToRadio() || handler_.inTx();
+        f.shift     = shiftOf(rf.tx_mhz, rf.rx_mhz);
+        // Fréquence AFFICHÉE : émission pendant le PTT, réception sinon.
+        f.rxMHz     = (f.tx && rf.tx_mhz > 1.0) ? rf.tx_mhz : rf.rx_mhz;
 #if TNC_ENABLE
         f.txAprs    = f.tx && (millis() - beaconQueuedMs_ < 6000);
-        // Pendant la balise APRS, l'écran montre la fréquence du canal APRS
-        // (celui sur lequel la trame part réellement), pas le canal écouté.
+        // Pendant la balise APRS, l'écran montre le canal APRS (celui sur lequel
+        // la trame part réellement) et sa fréquence d'émission.
         if (f.txAprs && beaconDispCh_ < CHANNEL_COUNT) {
             RadioState::ActiveRf b = handler_.channelRf(beaconDispCh_);
             if (b.rx_mhz > 1.0) {
-                f.rxMHz     = b.rx_mhz;
+                f.rxMHz     = (b.tx_mhz > 1.0) ? b.tx_mhz : b.rx_mhz;
                 f.wide      = b.wide;
+                f.shift     = shiftOf(b.tx_mhz, b.rx_mhz);
                 f.channelId = beaconDispCh_;
                 strlcpy(f.channel, handler_.channelName(beaconDispCh_).c_str(), sizeof(f.channel));
             }
         }
 #endif
         f.bt        = (cmdHandle_ != 0);
+        // Indicatif affiché : "ID station" (onglet PTT release) s'il est
+        // renseigné, sinon l'indicatif APRS (aprsCallsign + SSID du BSS).
+        {
+            String sid = handler_.aprsConfig().stationId();
+            String cs  = handler_.aprsConfig().callsign();
+            int    sd  = handler_.aprsConfig().ssid();
+            if (sid.length() && sid != "NOCALL") {
+                strlcpy(f.callsign, sid.c_str(), sizeof(f.callsign));
+            } else if (cs.length() && cs != "NOCALL" && cs != "N0CALL") {
+                if (sd > 0) snprintf(f.callsign, sizeof(f.callsign), "%s-%d", cs.c_str(), sd);
+                else        snprintf(f.callsign, sizeof(f.callsign), "%s", cs.c_str());
+            }
+        }
 #if (TNC_ENABLE && APRS_GPS_ENABLE)
         f.gpsFix    = gps_.fixType();
         f.gpsSats   = gps_.sats();

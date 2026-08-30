@@ -6,69 +6,81 @@
 
 #if DISPLAY_ENABLE
 
-#include <Wire.h>
+#include <SPI.h>
 #include "RadioFace.h"
-#include "RadioDisplay.h"     // vide si DISPLAY_HAS_ILI9225 est faux
-#include "NextionDisplay.h"   // vide si DISPLAY_HAS_NEXTION est faux
+#include "RadioDisplay.h"      // ILI9225 (vide si DISPLAY_HAS_ILI9225 faux)
+#include "RadioDisplay341.h"   // ILI9341 (vide si DISPLAY_HAS_ILI9341 faux)
 
 // ============================================================================
-// Aiguilleur d'écran de façade.
+// Aiguilleur d'écran de façade (SPI direct, plus de MCP23017).
 //
-// DISPLAY_DRIVER = ILI9225 / NEXTION -> le pilote est fixé à la compilation.
-// DISPLAY_DRIVER = AUTO              -> détection au démarrage :
-//     - MCP23017 qui répond sur l'I2C           -> pilote ILI9225
-//     - "comok" reçu sur l'UART Nextion         -> pilote Nextion
-//     - rien                                    -> aucun pilote (0 octet de tas)
+// DISPLAY_DRIVER = ILI9225 / ILI9341 -> pilote fixé à la compilation.
+// DISPLAY_DRIVER = AUTO              -> détection au démarrage par lecture de
+//   l'ID sur le bus SPI :  0x9341 -> ILI9341 (+ tactile si présent),
+//                          0x9225 -> ILI9225,  sinon -> aucun pilote.
 //
-// Le pilote détecté est alloué sur le TAS (via start(), différé), pas en .bss :
-// "pas d'écran" ne coûte donc rien, et un seul pilote occupe la mémoire.
+// Le pilote détecté est alloué sur le TAS (start(), différé), pas en .bss.
 // ============================================================================
 
 class FaceDisplay {
 public:
-    enum Kind { NONE, ILI9225, NEXTION };
-    using PcmSource = std::function<void(int16_t*)>;
+    enum Kind { NONE, ILI9225, ILI9341 };
+    using PcmSource   = std::function<void(int16_t*)>;
+    using TouchAction = std::function<void(int)>;
 
-    void setPcmSource(PcmSource fn) { pcm_ = std::move(fn); }
+    void setPcmSource(PcmSource fn)     { pcm_ = std::move(fn); }
+    void setTouchAction(TouchAction fn) { touchCb_ = std::move(fn); }
 
-    // Sonde le matériel (une seule fois) et mémorise le type d'écran.
     Kind detect() {
         if (detected_) return kind_;
         detected_ = true;
+        // UN seul bus SPI (HSPI), initialisé ici, réutilisé par les sondes ET
+        // le pilote -> pas de cycle new/begin/end/delete de SPIClass.
+        spi_.begin(DISPLAY_SPI_SCK, DISPLAY_SPI_MISO, DISPLAY_SPI_MOSI, -1);
 #if DISPLAY_DRIVER == DISPLAY_DRIVER_ILI9225
         kind_ = ILI9225;
-#elif DISPLAY_DRIVER == DISPLAY_DRIVER_NEXTION
-        kind_ = NEXTION;
+#elif DISPLAY_DRIVER == DISPLAY_DRIVER_ILI9341
+        kind_ = ILI9341;
 #else
-        if      (probeIli9225()) kind_ = ILI9225;
-        else if (probeNextion()) kind_ = NEXTION;
-        else                     kind_ = NONE;
+        uint32_t id41 = Ili9341::probeId(&spi_);
+        Serial.printf("[DISP] ID SPI (0xD3) = 0x%06X\n", id41);
+        if ((id41 & 0xFFFF) == 0x9341) { kind_ = ILI9341; }
+        else {
+            uint32_t id25 = Ili9225::probeId(&spi_);
+            Serial.printf("[DISP] ID SPI (reg0) = 0x%04X\n", id25);
+            if (id25 == 0x9225) {
+                kind_ = ILI9225;
+            } else if (DISPLAY_AUTO_FALLBACK_ILI9225) {
+                kind_ = ILI9225;
+                Serial.println("[DISP] pas d'ID lisible -> ILI9225 par defaut (repli)");
+            } else {
+                kind_ = NONE;
+            }
+        }
 #endif
         Serial.printf("[DISP] ecran detecte : %s\n",
-                      kind_ == ILI9225 ? "ILI9225 (MCP23017)" :
-                      kind_ == NEXTION ? "Nextion (UART)" : "aucun");
+                      kind_ == ILI9225 ? "ILI9225" :
+                      kind_ == ILI9341 ? "ILI9341 (SPI)" : "aucun");
         return kind_;
     }
-
     Kind kind() const { return kind_; }
 
-    // Alloue et démarre le pilote détecté. À appeler une fois, en différé
-    // (après publication du service SDP). Renvoie false si aucun / échec.
     bool start() {
 #if DISPLAY_HAS_ILI9225
         if (kind_ == ILI9225) {
             ili_ = new (std::nothrow) RadioDisplay();
-            if (!ili_) { Serial.println("[DISP] alloc pilote ILI9225 impossible"); return false; }
+            if (!ili_) { Serial.println("[DISP] alloc ILI9225 impossible"); return false; }
             ili_->setPcmSource(pcm_);
-            return ili_->begin();
+            return ili_->begin(&spi_);
         }
 #endif
-#if DISPLAY_HAS_NEXTION
-        if (kind_ == NEXTION) {
-            nex_ = new (std::nothrow) NextionDisplay();
-            if (!nex_) { Serial.println("[DISP] alloc pilote Nextion impossible"); return false; }
-            nex_->setPcmSource(pcm_);
-            return nex_->begin();
+#if DISPLAY_HAS_ILI9341
+        if (kind_ == ILI9341) {
+            d341_ = new (std::nothrow) RadioDisplay341();
+            if (!d341_) { Serial.println("[DISP] alloc ILI9341 impossible"); return false; }
+            d341_->setPcmSource(pcm_);
+            d341_->setTouchAction(touchCb_);
+            return d341_->begin(&spi_);
         }
 #endif
         return false;
@@ -78,58 +90,23 @@ public:
 #if DISPLAY_HAS_ILI9225
         if (ili_) { ili_->set(f); return; }
 #endif
-#if DISPLAY_HAS_NEXTION
-        if (nex_) { nex_->set(f); return; }
+#if DISPLAY_HAS_ILI9341
+        if (d341_) { d341_->set(f); return; }
 #endif
         (void)f;
     }
 
 private:
-#if DISPLAY_DRIVER == DISPLAY_DRIVER_AUTO
-    // MCP23017 (donc écran ILI9225) présent sur l'I2C ?
-    static bool probeIli9225() {
-        Wire.begin(DISPLAY_I2C_SDA, DISPLAY_I2C_SCL, 100000);
-        Wire.beginTransmission(MCP23017_ADDR);
-        bool ok = (Wire.endTransmission() == 0);
-        Wire.end();                       // libère 21/22 pour un éventuel Nextion
-        return ok;
-    }
-    // Un Nextion répond "comok" à la commande "connect" (aux 2 débits usuels).
-    static bool probeNextion() {
-        const int bauds[2] = { NEXTION_BAUD, 9600 };
-        static const uint8_t req[] =
-            { 0xFF, 0xFF, 0xFF, 'c','o','n','n','e','c','t', 0xFF, 0xFF, 0xFF };
-        for (int i = 0; i < 2; i++) {
-            Serial1.begin(bauds[i], SERIAL_8N1, NEXTION_RX_GPIO, NEXTION_TX_GPIO);
-            delay(30);
-            while (Serial1.available()) Serial1.read();
-            Serial1.write(req, sizeof(req));
-            Serial1.flush();
-            const char* want = "comok";
-            int m = 0;
-            uint32_t t0 = millis();
-            while (millis() - t0 < 250) {
-                while (Serial1.available()) {
-                    char c = (char)Serial1.read();
-                    m = (c == want[m]) ? m + 1 : (c == want[0] ? 1 : 0);
-                    if (m == 5) { Serial1.end(); return true; }
-                }
-                delay(4);
-            }
-            Serial1.end();
-        }
-        return false;
-    }
-#endif  // AUTO
-
-    Kind      kind_ = NONE;
-    bool      detected_ = false;
-    PcmSource pcm_;
+    SPIClass    spi_{HSPI};
+    Kind        kind_ = NONE;
+    bool        detected_ = false;
+    PcmSource   pcm_;
+    TouchAction touchCb_;
 #if DISPLAY_HAS_ILI9225
-    RadioDisplay*   ili_ = nullptr;
+    RadioDisplay*    ili_  = nullptr;
 #endif
-#if DISPLAY_HAS_NEXTION
-    NextionDisplay* nex_ = nullptr;
+#if DISPLAY_HAS_ILI9341
+    RadioDisplay341* d341_ = nullptr;
 #endif
 };
 
