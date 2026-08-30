@@ -125,15 +125,15 @@ private:
         // top bar : n° canal + nom | H/L +/- CTCSS | BT | GPS
         if (F || f.channelId != c_.channelId || strcmp(f.channel, c_.channel)) {
             snprintf(b, sizeof(b), "%02u %s", f.channelId, f.channel);
-            tft_.fillRect(4, BAR_Y, 172, 16, BG);
+            tft_.fillRect(4, BAR_Y, 166, 16, BG);
             tft_.text(4, BAR_Y, b, AMBER, BG, 2);
         }
         if (F || f.highPower != c_.highPower || f.shift != c_.shift || f.tone != c_.tone) {
             snprintf(b, sizeof(b), "%s%s%s", f.highPower ? "H" : "L",
                      f.shift > 0 ? " +" : (f.shift < 0 ? " -" : ""),
                      f.tone == 2 ? " CT" : (f.tone == 1 ? " T" : ""));
-            tft_.fillRect(178, BAR_Y, 64, 16, BG);
-            tft_.text(178, BAR_Y, b, f.highPower ? AMBER : SEG, BG, 2);
+            tft_.fillRect(174, BAR_Y, 74, 16, BG);
+            tft_.text(174, BAR_Y, b, f.highPower ? AMBER : SEG, BG, 2);
         }
         if (F || f.bt != c_.bt) tft_.text(250, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 2);
 

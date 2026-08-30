@@ -202,8 +202,8 @@ private:
             snprintf(s, sizeof(s), "%s%s%s", f.highPower ? "H" : "L",
                      f.shift > 0 ? " +" : (f.shift < 0 ? " -" : ""),
                      f.tone == 2 ? " CT" : (f.tone == 1 ? " T" : ""));
-            tft_.fillRect(80, BAR_Y, 40, 8, BG);
-            tft_.text(80, BAR_Y, s, f.highPower ? AMBER : C_WHITE, BG, 1);
+            tft_.fillRect(100, BAR_Y, 40, 8, BG);
+            tft_.text(100, BAR_Y, s, f.highPower ? AMBER : C_WHITE, BG, 1);
         }
         if (F || f.bt != c_.bt)
             tft_.text(158, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 1);
