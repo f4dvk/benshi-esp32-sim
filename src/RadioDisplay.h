@@ -191,19 +191,19 @@ private:
     void render(const RadioFace& f) {
         bool F = first_;
 
-        // ---- barre haute : n° canal + nom | shift | puissance | BT | GPS ----
+        // ---- barre haute : n° canal + nom | H/L +/- CTCSS | BT | GPS ----
         if (F || f.channelId != c_.channelId || strcmp(f.channel, c_.channel)) {
             char s[16]; snprintf(s, sizeof(s), "%02u %s", f.channelId, f.channel);
-            tft_.fillRect(0, BAR_Y, 88, 8, BG);
+            tft_.fillRect(0, BAR_Y, 76, 8, BG);
             tft_.text(4, BAR_Y, s, AMBER, BG, 1);
         }
-        if (F || f.shift != c_.shift) {
-            tft_.fillRect(92, BAR_Y, 8, 8, BG);
-            tft_.text(92, BAR_Y, f.shift > 0 ? "+" : (f.shift < 0 ? "-" : ""), C_WHITE, BG, 1);
-        }
-        if (F || f.highPower != c_.highPower) {
-            tft_.fillRect(106, BAR_Y, 8, 8, BG);
-            tft_.text(106, BAR_Y, f.highPower ? "H" : "L", f.highPower ? AMBER : C_WHITE, BG, 1);
+        if (F || f.highPower != c_.highPower || f.shift != c_.shift || f.tone != c_.tone) {
+            char s[10];
+            snprintf(s, sizeof(s), "%s%s%s", f.highPower ? "H" : "L",
+                     f.shift > 0 ? " +" : (f.shift < 0 ? " -" : ""),
+                     f.tone == 2 ? " CT" : (f.tone == 1 ? " T" : ""));
+            tft_.fillRect(80, BAR_Y, 40, 8, BG);
+            tft_.text(80, BAR_Y, s, f.highPower ? AMBER : C_WHITE, BG, 1);
         }
         if (F || f.bt != c_.bt)
             tft_.text(158, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 1);

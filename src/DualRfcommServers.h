@@ -227,6 +227,10 @@ public:
         f.sqOpen    = handler_.sqOpen();
         f.tx        = audio_.txToRadio() || handler_.inTx();
         f.shift     = shiftOf(rf.tx_mhz, rf.rx_mhz);
+        {
+            bool txT = rf.tx_ctcss_hz > 1.0, rxT = rf.rx_ctcss_hz > 1.0;
+            f.tone  = (txT && rxT) ? 2 : (txT ? 1 : (rxT ? 2 : 0));   // 2 = "CT", 1 = "T"
+        }
         // Fréquence AFFICHÉE : émission pendant le PTT, réception sinon.
         f.rxMHz     = (f.tx && rf.tx_mhz > 1.0) ? rf.tx_mhz : rf.rx_mhz;
 #if TNC_ENABLE

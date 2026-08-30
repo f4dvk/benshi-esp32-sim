@@ -22,4 +22,5 @@ struct RadioFace {
     char    utc[9]     = {0};    // "HH:MM:SS" (GPS), vide si indisponible
     char    callsign[12] = {0};  // indicatif HTCommander (onglet Licence), "F4DVK-7" ; vide si non réglé
     int8_t  shift      = 0;      // décalage TX/RX : +1 = shift +, -1 = shift -, 0 = simplex
+    uint8_t tone       = 0;      // CTCSS : 0 = aucun, 1 = TX seul ("T"), 2 = TX+RX ("CT")
 };

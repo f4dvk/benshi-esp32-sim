@@ -122,27 +122,20 @@ private:
         bool F = first_;
         char b[28];
 
-        // top bar : n° canal + nom | shift | puissance | BT | GPS
+        // top bar : n° canal + nom | H/L +/- CTCSS | BT | GPS
         if (F || f.channelId != c_.channelId || strcmp(f.channel, c_.channel)) {
             snprintf(b, sizeof(b), "%02u %s", f.channelId, f.channel);
-            tft_.fillRect(4, BAR_Y, 168, 16, BG);
+            tft_.fillRect(4, BAR_Y, 172, 16, BG);
             tft_.text(4, BAR_Y, b, AMBER, BG, 2);
         }
-        if (F || f.shift != c_.shift) {
-            tft_.fillRect(174, BAR_Y, 14, 16, BG);
-            tft_.text(174, BAR_Y, f.shift > 0 ? "+" : (f.shift < 0 ? "-" : ""), C_WHITE, BG, 2);
+        if (F || f.highPower != c_.highPower || f.shift != c_.shift || f.tone != c_.tone) {
+            snprintf(b, sizeof(b), "%s%s%s", f.highPower ? "H" : "L",
+                     f.shift > 0 ? " +" : (f.shift < 0 ? " -" : ""),
+                     f.tone == 2 ? " CT" : (f.tone == 1 ? " T" : ""));
+            tft_.fillRect(178, BAR_Y, 64, 16, BG);
+            tft_.text(178, BAR_Y, b, f.highPower ? AMBER : SEG, BG, 2);
         }
-        if (F || f.highPower != c_.highPower) {
-            tft_.fillRect(196, BAR_Y, 14, 16, BG);
-            tft_.text(196, BAR_Y, f.highPower ? "H" : "L", f.highPower ? AMBER : SEG, BG, 2);
-        }
-        if (F || f.bt != c_.bt) tft_.text(220, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 2);
-        if (F || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
-            if (f.gpsFix >= 2) snprintf(b, sizeof(b), "%uD %02u", f.gpsFix, f.gpsSats);
-            else               snprintf(b, sizeof(b), "-- --");
-            tft_.fillRect(252, BAR_Y, W - 252, 16, BG);
-            tft_.textRight(W - 3, BAR_Y, b, f.gpsFix >= 2 ? OKG : DIM, BG, 2);
-        }
+        if (F || f.bt != c_.bt) tft_.text(250, BAR_Y, "BT", f.bt ? BT_ON : DIM, BG, 2);
 
         // fréquence (matrice de carrés)
         {
@@ -166,16 +159,22 @@ private:
             if (F || recol) tft_.fillRect(dotX(), FY + DGH - 9, 9, 9, on);
         }
 
-        // mode + UTC (taille 2)
+        // mode | GPS | heure UTC (taille 2)
         if (F || f.wide != c_.wide) {
-            tft_.fillRect(4, MODE_Y, 170, 16, BG);
+            tft_.fillRect(4, MODE_Y, 150, 16, BG);
             tft_.text(4, MODE_Y, "FM", C_WHITE, BG, 2);
             tft_.text(40, MODE_Y, f.wide ? "WIDE 25k" : "NARR 12k", LBL, BG, 2);
         }
+        if (F || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
+            if (f.gpsFix >= 2) snprintf(b, sizeof(b), "%uD %02u", f.gpsFix, f.gpsSats);
+            else               snprintf(b, sizeof(b), "-- --");
+            tft_.fillRect(158, MODE_Y, 62, 16, BG);
+            tft_.text(158, MODE_Y, b, f.gpsFix >= 2 ? OKG : DIM, BG, 2);
+        }
         if (F || strcmp(f.utc, c_.utc)) {
-            snprintf(b, sizeof(b), "UTC %s", f.utc[0] ? f.utc : "--:--:--");
-            tft_.fillRect(W - 150, MODE_Y, 150, 16, BG);
-            tft_.textRight(W - 3, MODE_Y, b, f.utc[0] ? OKG : DIM, BG, 2);
+            const char* t = f.utc[0] ? f.utc : "--:--:--";
+            tft_.fillRect(W - 102, MODE_Y, 102, 16, BG);
+            tft_.textRight(W - 3, MODE_Y, t, f.utc[0] ? OKG : DIM, BG, 2);
         }
 
         // S-mètre
