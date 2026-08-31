@@ -154,6 +154,29 @@ cmake --build build/Fusion -j
   forcé à 0 (`v->Compander`) en audio plat. Vérifier au rebase que la
   correspondance des bits `REG_2B` du BK4829 n'a pas changé (voir
   `BK4819_EnterBypass` / `BK4819_EnterRaw` dans `driver/bk4829.c`).
+- **Double veille (H18, ajusté H19-H21)** : `HOST_Enter()` force
+  `gEeprom.DUAL_WATCH = OFF` et le mode hôte suspend `APP_Update()` (donc
+  `DualwatchAlternate()`). `HOST_DualWatchTick()` (en tête de `HOST_Tick10ms`)
+  réimplémente l'alternance : bascule `gEeprom.RX_VFO` toutes les ~120 ms.
+  Verrouillage : **`s_afOpen`** (audio réellement ouvert) fige indéfiniment ;
+  une porteuse seule (`s_sqOpen` sans audio) ne donne qu'une **grâce bornée**
+  (`HOST_DW_CARRIER_10MS` ~600 ms, le temps du décodage CTCSS) — sinon du bruit
+  de bande ou un squelch trop bas figerait le balayage. `s_squelch == 0`
+  désactive la DW (AF toujours ouvert). `HOST_SetRadio` arme `s_dualWatch` /
+  `s_dwCountdown`. `HOST_Ptt` émet sur le VFO écouté (TDR) si verrouillé, sinon
+  sur `TX_VFO`. `GET_STATUS` flags : b4 = VFO RX courant, b5 = DW active.
+  `s_cssRequired` recalé sur le VFO courant à chaque tick.
+  **H21 — NE PAS appeler `RADIO_SelectVfos()` dans la bascule** : avec
+  `DUAL_WATCH != OFF` il refait `gEeprom.RX_VFO = gEeprom.TX_VFO` et annule
+  aussitôt la bascule (le poste restait collé au VFO primaire). On règle `gRxVfo`
+  directement + `RADIO_SetupRegisters(false)`, comme `DualwatchAlternate()` du
+  stock. Vérifier au rebase : `gEeprom.RX_VFO` / `gRxVfo` /
+  `RADIO_SelectVfos` (test `DUAL_WATCH`) / `DUAL_WATCH_CHAN_A/B`.
+- **Squelch 0 = AF permanent (H20)** : `HOST_ApplyVfo` écrit `gEeprom.SQUELCH_LEVEL`
+  **toujours**, y compris 0. Avant (`if (s_squelch) …`) un niveau précédent
+  restait actif -> le squelch matériel du BK4819 coupait quand même l'AF en mode
+  « données » (squelch 0). `SQUELCH_LEVEL` du menu est sauvé/restauré par
+  `HOST_Enter`/`HOST_Exit` (`s_savedSquelch`).
 - **`HOST_OpenAudio` léger (H17)** : ne fait QUE lever le mute AF
   (`BK4819_SetAF`), pas un `RADIO_SetModulation` complet. Un
   `RADIO_SetModulation` à chaque ouverture de squelch reprogramme tout le

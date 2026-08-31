@@ -141,7 +141,8 @@ typedef struct __attribute__((__packed__)) {
     int16_t  rssi_dBm;
     uint8_t  ctcssType;  // BK4819_GetCTCType()
     uint16_t batterymV;
-    uint8_t  flags;      // b0 host active, b1 in TX, b2 monitor, b3 signal reçu
+    uint8_t  flags;      // b0 host active, b1 in TX, b2 monitor, b3 signal reçu,
+                         //   b4 VFO RX courant (0/1), b5 double veille active
     uint8_t  sq;         // diagnostic squelch : b0 s_squelch>0, b1 cssRequired,
                          //   b2 sqOpen, b3 cssOk, b4 afOpen
     uint8_t  sqLevel;    // s_squelch (0..9)
@@ -157,6 +158,15 @@ typedef struct __attribute__((__packed__)) {
 static bool     s_active       = false;
 static uint16_t s_watchdog     = 0;
 static uint8_t  s_savedDualWatch = DUAL_WATCH_OFF;
+static uint8_t  s_savedSquelch  = 0;   // SQUELCH_LEVEL du menu, restauré à la sortie
+
+// Double veille en mode hôte : la boucle firmware (DualwatchAlternate) est
+// suspendue, on alterne nous-mêmes les VFO dans HOST_Tick10ms.
+static uint8_t  s_dualWatch    = DUAL_WATCH_OFF;   // 0 off, 1 VFO A, 2 VFO B
+static uint16_t s_dwCountdown  = 0;                // unités 10 ms : temps sur le VFO courant
+static uint16_t s_dwCarrier    = 0;                // unités 10 ms : porteuse sans audio (borné)
+#define HOST_DW_TOGGLE_10MS   12                   // ~120 ms par VFO en balayage
+#define HOST_DW_CARRIER_10MS  60                   // ~600 ms de grâce sur une porteuse (décodage CTCSS)
 
 // Squelch en mode hôte (la boucle du firmware qui le gérerait est suspendue).
 static uint8_t  s_squelch      = 0;      // 0 = AF toujours ouvert
@@ -184,6 +194,7 @@ static void HOST_Enter(void)
 
     // Stop the firmware from time-slicing VFOs while the host drives.
     s_savedDualWatch    = gEeprom.DUAL_WATCH;
+    s_savedSquelch      = gEeprom.SQUELCH_LEVEL;
     gEeprom.DUAL_WATCH  = DUAL_WATCH_OFF;   // RAM only, not persisted
     gScanStateDir       = SCAN_OFF;
 
@@ -203,7 +214,9 @@ void HOST_Exit(void)
         gCurrentFunction = FUNCTION_FOREGROUND;   // coupe le PA via RADIO_SetupRegisters ci-dessous
 
     s_flatAudio = false;   // rend la chaine AF normale au firmware
-    gEeprom.DUAL_WATCH = s_savedDualWatch;
+    s_dualWatch = DUAL_WATCH_OFF;
+    gEeprom.DUAL_WATCH    = s_savedDualWatch;
+    gEeprom.SQUELCH_LEVEL = s_savedSquelch;
 
     // Hand the radio back to the firmware with a clean reload from EEPROM.
     RADIO_ConfigureChannel(0, VFO_CONFIGURE_RELOAD);
@@ -277,6 +290,52 @@ static void HOST_MuteAudio(void)
     s_afOpen = false;
 }
 
+// Double veille : alterne les deux VFO tant qu'aucun signal n'est capté ; se
+// verrouille sur le VFO qui reçoit (squelch + CTCSS OK). Remplace la boucle
+// DualwatchAlternate() du firmware, suspendue en mode hôte. Appelé au début de
+// HOST_Tick10ms, avant le gating audio.
+static void HOST_DualWatchTick(void)
+{
+    if (s_dualWatch == DUAL_WATCH_OFF || s_squelch == 0 || s_monitor)
+        return;   // squelch 0 = AF toujours ouvert -> pas de balayage possible
+
+    // Chaque VFO a son propre ton RX -> on recale le besoin CTCSS sur le VFO
+    // courant (en mono-VFO c'est HOST_ApplyVfo qui fixe s_cssRequired).
+    s_cssRequired = (gRxVfo->pRX->CodeType != CODE_TYPE_OFF);
+
+    // Audio réellement ouvert (squelch + CTCSS OK, passé par le gating) -> on
+    // reste verrouillé tant qu'il y a du son.
+    if (s_afOpen) {
+        s_dwCountdown = HOST_DW_TOGGLE_10MS;
+        s_dwCarrier   = 0;
+        return;
+    }
+
+    // Porteuse détectée mais pas (encore) d'audio : on patiente, le temps que
+    // le décodeur CTCSS se cale ou que le gating ouvre l'AF. BORNÉ : du bruit de
+    // bande / un squelch réglé trop bas ne doit pas figer le balayage.
+    if (s_sqOpen) {
+        if (++s_dwCarrier < HOST_DW_CARRIER_10MS)
+            return;
+    } else {
+        s_dwCarrier = 0;
+    }
+
+    if (s_dwCountdown > 0 && --s_dwCountdown > 0)
+        return;
+    s_dwCountdown = HOST_DW_TOGGLE_10MS;
+    s_dwCarrier   = 0;
+
+    // NE PAS appeler RADIO_SelectVfos() ici : avec DUAL_WATCH != OFF il refait
+    // gEeprom.RX_VFO = gEeprom.TX_VFO -> notre bascule serait immédiatement
+    // annulée (le poste restait collé au VFO primaire, jamais de balayage).
+    // On règle gRxVfo directement, comme DualwatchAlternate() du firmware stock.
+    gEeprom.RX_VFO = gEeprom.RX_VFO ? 0 : 1;
+    gRxVfo         = &gEeprom.VfoInfo[gEeprom.RX_VFO];
+    RADIO_SetupRegisters(false);
+    s_sqOpen = s_cssOk = false;
+}
+
 // Sert le squelch matériel + le gating CTCSS/CDCSS RX quand un niveau de
 // squelch a été demandé. Appelé toutes les 10 ms en mode hôte.
 void HOST_Tick10ms(void)
@@ -295,6 +354,8 @@ void HOST_Tick10ms(void)
         if (it & (1u << 2)) s_sqOpen = true;
         if (it & (1u << 3)) s_sqOpen = false;
     }
+
+    HOST_DualWatchTick();   // peut recaler s_cssRequired sur le VFO courant
 
     // CTCSS / CDCSS RX : lecture directe du type détecté (niveau fiable ;
     // les interruptions ctcssFound/Lost se sont révélées inversées ici).
@@ -343,8 +404,12 @@ static void HOST_ApplyVfo(const HOST_SetVfo_t *c)
 
     s_squelch     = (c->squelch <= 9) ? c->squelch : 9;
     s_cssRequired = (v->freq_config_RX.CodeType != CODE_TYPE_OFF);
-    if (s_squelch)
-        gEeprom.SQUELCH_LEVEL = s_squelch;
+    // En mode hôte l'ESP est maître du squelch -> on l'écrit TOUJOURS, y compris
+    // 0 : SQUELCH_LEVEL 0 = seuils au minimum = squelch matériel grand ouvert.
+    // Sinon (ancien code : « if (s_squelch) »), un niveau précédent restait en
+    // place et le squelch matériel du BK4819 continuait de couper l'AF même en
+    // mode « données / AF permanent » (squelch 0).
+    gEeprom.SQUELCH_LEVEL = s_squelch;
 
     RADIO_ConfigureSquelchAndOutputPower(v);   // -> Squelch*Thresh selon SQUELCH_LEVEL
     RADIO_SelectVfos();
@@ -367,6 +432,15 @@ static void HOST_SetRadio(const HOST_SetRadio_t *c)
     gEeprom.VfoInfo[0].TX_LOCK = c->txLock ? true : false;
     gEeprom.VfoInfo[1].TX_LOCK = c->txLock ? true : false;
 
+    s_dualWatch = c->dualWatch;
+    if (s_dualWatch != DUAL_WATCH_OFF) {
+        gEeprom.RX_VFO = (s_dualWatch == DUAL_WATCH_CHAN_B) ? 1 : 0;
+        s_dwCountdown  = HOST_DW_TOGGLE_10MS;
+        s_dwCarrier    = 0;
+    } else {
+        gEeprom.RX_VFO = gEeprom.TX_VFO;
+    }
+
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);
 }
@@ -377,7 +451,12 @@ static void HOST_SetRadio(const HOST_SetRadio_t *c)
 // Reproduit uniquement la séquence RF de RADIO_SetTxParameters().
 static void HOST_Ptt(uint8_t on)
 {
-    VFO_Info_t *v = &gEeprom.VfoInfo[gEeprom.TX_VFO & 1];
+    // En double veille, si on écoute activement un VFO on répond dessus (TDR),
+    // sinon on émet sur le VFO principal.
+    uint8_t txi = (s_dualWatch != DUAL_WATCH_OFF && s_afOpen)
+                ? (uint8_t)(gEeprom.RX_VFO & 1)
+                : (uint8_t)(gEeprom.TX_VFO & 1);
+    VFO_Info_t *v = &gEeprom.VfoInfo[txi];
 
     if (on) {
         gSerialConfigCountDown_500ms = 0;
@@ -461,11 +540,14 @@ static void HOST_SendStatus(uint32_t Port)
     st.batterymV = (uint16_t)(gBatteryVoltageAverage * 10);   // 10 mV -> mV
     // b0 mode hôte actif, b1 en TX, b2 monitor forcé, b3 signal reçu présent
     // (squelch ouvert + ton/code RX OK) -> l'ESP32 le mappe sur is_sq.
+    // b4 VFO RX courant (0/1), b5 double veille active (-> écran de façade).
     const bool sig = s_sqOpen && (!s_cssRequired || s_cssOk);
     st.flags     = (uint8_t)((s_active ? 1 : 0)
                  | ((gCurrentFunction == FUNCTION_TRANSMIT) ? 2 : 0)
                  | (s_monitor ? 4 : 0)
-                 | (sig ? 8 : 0));
+                 | (sig ? 8 : 0)
+                 | ((gEeprom.RX_VFO & 1) ? 16 : 0)
+                 | ((s_dualWatch != DUAL_WATCH_OFF) ? 32 : 0));
     st.sq        = (uint8_t)(((s_squelch != 0) ? 1 : 0)
                  | (s_cssRequired ? 2 : 0)
                  | (s_sqOpen ? 4 : 0)
