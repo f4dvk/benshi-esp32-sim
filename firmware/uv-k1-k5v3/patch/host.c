@@ -107,7 +107,12 @@ typedef struct __attribute__((__packed__)) {
     uint16_t step;        // StepFrequency (10 Hz units), 0 = keep
     uint8_t  squelch;     // 0 = AF toujours ouvert (données) ; 1..9 = squelch
                           //     matériel + gating CTCSS/CDCSS RX (phonie)
+    uint8_t  flags;       // b0 = audio PLAT : bypass pré/dé-emphase + HPF/LPF AF
+                          //      (RX et TX) + compander off -> pour l'AFSK/APRS.
+                          //      Equivalent du bit pre_de_emph_bypass du SA818.
 } HOST_SetVfo_t;
+
+#define HOST_VFO_FLAG_FLAT_AUDIO  0x01
 
 typedef struct __attribute__((__packed__)) {
     HOST_Header_t Header;
@@ -156,6 +161,7 @@ static uint8_t  s_savedDualWatch = DUAL_WATCH_OFF;
 // Squelch en mode hôte (la boucle du firmware qui le gérerait est suspendue).
 static uint8_t  s_squelch      = 0;      // 0 = AF toujours ouvert
 static bool     s_cssRequired  = false;  // un ton/code RX est configuré
+static bool     s_flatAudio    = false;  // SET_VFO flags b0 : bypass emphase / filtres AF
 static bool     s_sqOpen       = false;  // squelch matériel ouvert (sqlLost)
 static bool     s_cssOk        = false;  // ton/code RX détecté
 static bool     s_afOpen       = false;  // état courant du chemin audio
@@ -196,6 +202,7 @@ void HOST_Exit(void)
     if (gCurrentFunction == FUNCTION_TRANSMIT)
         gCurrentFunction = FUNCTION_FOREGROUND;   // coupe le PA via RADIO_SetupRegisters ci-dessous
 
+    s_flatAudio = false;   // rend la chaine AF normale au firmware
     gEeprom.DUAL_WATCH = s_savedDualWatch;
 
     // Hand the radio back to the firmware with a clean reload from EEPROM.
@@ -225,14 +232,38 @@ void HOST_Tick500ms(void)
 // n'ouvrirait le chemin audio. On force donc l'AF ouvert en continu (squelch
 // grand ouvert, comme un SA818 avec squelch=0) -> l'audio reçu sort en
 // permanence sur le HP / la prise casque (que l'ESP32 capte).
+// Filtres AF du BK4829 (REG_2B). En mode "audio plat" (s_flatAudio) on bypasse
+// TOUT le conditionnement AF, RX et TX, pour laisser passer l'AFSK 1200 sans
+// distorsion (equivalent du pre_de_emph_bypass du SA818) :
+//   b10 = desactive HPF 300 Hz RX      b2 = desactive HPF 300 Hz TX
+//   b9  = desactive LPF 3 kHz RX       b1 = desactive LPF 1 TX
+//   b8  = desactive desaccentuation RX b0 = desactive preaccentuation TX
+// Sinon on remet ces bits a 0 (chaine AF FM normale). A rappeler apres tout ce
+// qui reecrit REG_2B : RADIO_SetupRegisters (-> BK4819_DisableScramble met 0),
+// et la sequence de keying TX.
+#define HOST_AF_FLAT_MASK  ((1u<<10)|(1u<<9)|(1u<<8)|(1u<<2)|(1u<<1)|(1u<<0))
+static void HOST_ApplyAudioFilters(void)
+{
+    uint16_t reg2b = BK4819_ReadRegister(BK4819_REG_2B);
+    if (s_flatAudio)
+        reg2b |= HOST_AF_FLAT_MASK;
+    else
+        reg2b &= ~HOST_AF_FLAT_MASK;
+    BK4819_WriteRegister(BK4819_REG_2B, reg2b);
+}
+
 static void HOST_OpenAudio(void)
 {
-    // BK4819_SetAF(BK4819_AF_FM) (via RADIO_SetModulation) active directement le
-    // DAC audio / RX DSP -> l'AF sort quel que soit l'état du squelch (le mute
-    // sur squelch fermé est une politique du firmware, dont la boucle est
-    // suspendue ici). Pas besoin de toucher BK4819_SetupSquelch.
-    RADIO_SetModulation(gRxVfo->Modulation);
+    // La modulation / l'AGC / les filtres sont déjà configurés par HOST_ApplyVfo
+    // (-> RADIO_SetupRegisters -> RADIO_SetModulation). Ici on ne fait QUE lever
+    // le mute AF : un RADIO_SetModulation complet à chaque ouverture de squelch
+    // reprogramme tout le BK4819 (~50-100 ms de glitch/silence) -> l'audio
+    // "arrive en retard" à chaque salve, ce que le SA818 (audio ligne continu)
+    // n'a pas.
+    BK4819_SetAF((gRxVfo && gRxVfo->Modulation == MODULATION_USB)
+                 ? BK4819_AF_BASEBAND2 : BK4819_AF_FM);
     BK4819_SetRxAudioGain();
+    HOST_ApplyAudioFilters();
     AUDIO_AudioPathOn();
     gEnableSpeaker = true;
     s_afOpen = true;
@@ -304,6 +335,10 @@ static void HOST_ApplyVfo(const HOST_SetVfo_t *c)
     if (c->step)
         v->StepFrequency = c->step;
 
+    s_flatAudio = (c->flags & HOST_VFO_FLAG_FLAT_AUDIO) != 0;
+    if (s_flatAudio)
+        v->Compander = 0;   // le compander deformerait l'AFSK -> off en audio plat
+
     v->Band = FREQUENCY_GetBand(v->freq_config_RX.Frequency);
 
     s_squelch     = (c->squelch <= 9) ? c->squelch : 9;
@@ -314,6 +349,7 @@ static void HOST_ApplyVfo(const HOST_SetVfo_t *c)
     RADIO_ConfigureSquelchAndOutputPower(v);   // -> Squelch*Thresh selon SQUELCH_LEVEL
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);                // BK4819_SetupSquelch + CTCSS/CDCSS RX
+    HOST_ApplyAudioFilters();                  // apres RADIO_SetupRegisters (qui remet REG_2B a 0)
 
     s_sqOpen = s_cssOk = false;
     if (s_squelch == 0)
@@ -362,6 +398,7 @@ static void HOST_Ptt(uint8_t on)
                                                          v->freq_config_TX.Code));
         else
             BK4819_ExitSubAu();
+        HOST_ApplyAudioFilters();   // pré-emphase TX bypassée si audio plat (AFSK)
         BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, true);
         gCurrentFunction = FUNCTION_TRANSMIT;
         s_txGuard = HOST_TX_MAX_500MS;
@@ -373,6 +410,7 @@ static void HOST_Ptt(uint8_t on)
         BK4819_ExitSubAu();
         BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, false);
         RADIO_SetupRegisters(true);
+        HOST_ApplyAudioFilters();
         if (s_squelch == 0 || s_monitor) {
             HOST_OpenAudio();
         } else {

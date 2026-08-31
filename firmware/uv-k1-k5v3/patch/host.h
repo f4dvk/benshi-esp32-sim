@@ -35,7 +35,7 @@
 // modification de host.c/host.h. Renvoyée dans la réponse 0x0630 ET ajoutée
 // à la chaîne de version affichée par la radio (suffixe ".H<n>", via
 // -DVERSION_STRING_2=... dans build.sh) -> confirmation visuelle du bon .bin.
-#define HOST_PROTO_VER 14
+#define HOST_PROTO_VER 17
 
 // Serial command IDs handled by host mode (outside the Quansheng 0x05xx range).
 #define HOST_CMD_MODE       0x0630   // {u8 enter}              -> {u8 active, u8 proto, char ver[16]}

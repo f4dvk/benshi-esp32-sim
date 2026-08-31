@@ -145,6 +145,24 @@ cmake --build build/Fusion -j
   `gBatteryVoltageAverage` (déjà maintenu par le firmware) à la place.
 - RSSI / bruit / glitch : lectures registre brutes (`BK4819_ReadRegister`
   REG 0x67 / 0x65 / 0x63), comme `CMD_0527`.
+- **Audio plat (`SET_VFO` flags b0)** : `HOST_ApplyAudioFilters()` force les bits
+  de bypass emphase / HPF / LPF dans `REG_2B` du BK4829
+  (b10/9/8 = RX HPF300 / LPF3k / désaccentuation, b2/1/0 = idem TX + préaccent.).
+  `RADIO_SetupRegisters()` remet `REG_2B` à 0 (via `BK4819_DisableScramble`) et
+  la séquence de keying TX aussi → le helper est rappelé après chacun
+  (`HOST_ApplyVfo`, `HOST_OpenAudio`, `HOST_Ptt` on/off). Le compander est aussi
+  forcé à 0 (`v->Compander`) en audio plat. Vérifier au rebase que la
+  correspondance des bits `REG_2B` du BK4829 n'a pas changé (voir
+  `BK4819_EnterBypass` / `BK4819_EnterRaw` dans `driver/bk4829.c`).
+- **`HOST_OpenAudio` léger (H17)** : ne fait QUE lever le mute AF
+  (`BK4819_SetAF`), pas un `RADIO_SetModulation` complet. Un
+  `RADIO_SetModulation` à chaque ouverture de squelch reprogramme tout le
+  BK4819 (~50-100 ms de silence/glitch) → l'audio « arrive en retard » à chaque
+  salve en mode hôte, ce que le SA818 (ligne audio continue) n'a pas. La
+  modulation/AGC/filtres restent posés par `HOST_ApplyVfo`
+  (→ `RADIO_SetupRegisters` → `RADIO_SetModulation`), une fois par retune.
+  (H16 avait tenté de figer l'AGC RX `BK4819_SetAGC(false)` — abandonné, l'AGC
+  du poste n'était pas en cause.)
 
 ## Points à revérifier lors d'un rebase F4HWN
 
