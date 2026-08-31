@@ -53,6 +53,9 @@ public:
     void onRxLevel(RxLevelFn fn) { rxLevelCb_ = std::move(fn); }
     void onTxState(TxStateFn fn) { txStateCb_ = std::move(fn); }
     void setChannelUp(bool up)   { channelUp_.store(up); }   // canal RFCOMM audio connecté ?
+    // Autorisation de capture RX (mode UV-K1 piloté : suit le "signal reçu" du
+    // GET_STATUS série ; par défaut true = pas de gating externe).
+    void setRxAllow(bool a)      { rxAllow_.store(a); }
 
     // --- Mode données (canal APRS) : l'audio ne passe plus par le SBC mais par
     //     le TNC. L'ADC est routé vers dataRxCb_, le DAC est alimenté par
@@ -622,7 +625,10 @@ private:
             // l'appli, qui décide. Le pin SQ matériel n'est alors qu'une
             // indication (RSSI / statut).
 #if AUDIO_RX_ALWAYS || (RF_MODULE_SQUELCH == 0) || RF_MODULE_UVK5_ENABLE
-            bool rxGate = channelUp_.load() && !tx;   // capture audio en continu
+            // Capture "en continu" MAIS soumise à rxAllow_ : en mode UV-K1
+            // piloté, le transport la ferme quand le GET_STATUS série dit
+            // "pas de signal" (sinon HTCommander voit du RX en permanence).
+            bool rxGate = channelUp_.load() && !tx && rxAllow_.load();
 #else
             bool rxGate = sqStable && !tx;
 #endif
@@ -706,6 +712,7 @@ private:
     std::atomic<bool>     micGateOpen_{false};  // capture ADC -> HTCommander ouverte
     std::atomic<bool>     sqDbg_{false};        // état brut du squelch (trace)
     std::atomic<bool>     channelUp_{false};    // canal RFCOMM audio connecté
+    std::atomic<bool>     rxAllow_{true};       // gating RX externe (UV-K1 piloté)
     std::atomic<uint32_t> encFrames_{0};        // trames SBC produites par txLoop
     std::atomic<uint32_t> adcSamples_{0};       // echantillons ADC lus (=> Hz reel)
     std::atomic<uint32_t> micClip_{0};          // echantillons ADC ecretes

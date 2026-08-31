@@ -298,6 +298,12 @@ public:
     // traces de mise au point de la chaine audio.
     void poll() {
         handler_.pollRf();
+#if RF_MODULE_UVK5_ENABLE
+        // Mode UV-K1 piloté : la capture RX suit le "signal reçu" du poste
+        // (bit SIG du GET_STATUS série, poussé dans sqOpen_ par pollUvK5).
+        if (uvk5_ && uvk5_->present())
+            audio_.setRxAllow(handler_.sqOpen());
+#endif
         flushAudioCoalesce();
 #if TNC_ENABLE
 #if APRS_GPS_ENABLE

@@ -142,7 +142,7 @@ public:
     void poll() {
         if (!present_) return;
         uint32_t now = millis();
-        if (now - lastPollMs_ < (uint32_t)RF_MODULE_UVK5_KEEPALIVE_MS) return;
+        if (now - lastPollMs_ < (uint32_t)RF_MODULE_UVK5_POLL_MS) return;
         lastPollMs_ = now;
         Status s;
         if (getStatus(s)) { last_ = s; fails_ = 0; }
