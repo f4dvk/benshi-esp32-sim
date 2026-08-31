@@ -471,6 +471,25 @@ private:
     // esp_spp_write en mode CB : une seule ecriture "en vol" (ESP_SPP_WRITE_EVT)
     // + respect de la congestion. Buffer d'ecriture FIXE.
     void pumpAudioTx() {
+        // Garde-fou tas : esp_spp_write alloue en interne (Bluedroid). Si le
+        // plus gros bloc libre devient trop petit (fragmentation), l'alloc
+        // renvoie NULL -> assert fixed_queue_enqueue -> reboot. On préfère
+        // jeter des trames audio.
+        if (ESP.getFreeHeap() < 16000 || ESP.getMaxAllocHeap() < 6000) {
+            lockAudio();
+            if (audioTxSb_) xStreamBufferReset(audioTxSb_);
+            unlockAudio();
+            dbgAudioDrop_++;
+#if AUDIO_DEBUG
+            uint32_t now = millis();
+            if (now - dbgLowHeapMs_ > 2000) {
+                dbgLowHeapMs_ = now;
+                Serial.printf("[AUDIO-TX] !! tas bas (%u o) -> audio jete\n",
+                              (unsigned)ESP.getFreeHeap());
+            }
+#endif
+            return;
+        }
         lockAudio();
         if (audioWriteInFlight_ || audioCong_ || audioHandle_ == 0 || !audioTxSb_) {
             unlockAudio();
@@ -1240,6 +1259,7 @@ private:
     uint32_t dbgAudioSent_  = 0;
     uint32_t dbgAudioDrop_  = 0;
     uint32_t dbgNoAudioChanMs_ = 0;
+    uint32_t dbgLowHeapMs_ = 0;
     uint16_t dbgAudioTypes_ = 0;
     bool     dbgTxDumped_ = false;
 };
