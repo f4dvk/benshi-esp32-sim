@@ -89,6 +89,12 @@ public:
         b[16] = 0; b[17] = 0;            // step (0 = inchangé)
         b[18] = p.squelch;
         b[19] = p.flatAudio ? 0x01 : 0x00;   // flags b0 : audio plat (firmware >= H15)
+#if AUDIO_DEBUG
+        Serial.printf("[UVK5] SET_VFO vfo=%u rx=%.4f tx=%.4f mod=%u bw=%u pwr=%u "
+                      "rxCT=%u/%u txCT=%u/%u sq=%u flat=%u\n",
+                      b[0], p.rxMHz, p.txMHz, b[9], b[10], b[11],
+                      b[12], b[13], b[14], b[15], b[18], b[19]);
+#endif
         return cmdOk(0x0631, b, sizeof(b));
     }
 
@@ -96,6 +102,10 @@ public:
     bool setRadio(uint8_t txVfo, uint8_t dualWatch, uint8_t crossBand = 0,
                   uint8_t txLock = 0) {
         uint8_t b[4] = { (uint8_t)(txVfo & 1), dualWatch, crossBand, txLock };
+#if AUDIO_DEBUG
+        Serial.printf("[UVK5] SET_RADIO txVfo=%u dualWatch=%u xband=%u txLock=%u\n",
+                      b[0], b[1], b[2], b[3]);
+#endif
         return cmdOk(0x0632, b, sizeof(b));
     }
 
@@ -146,10 +156,12 @@ public:
 
     // À appeler depuis loop() : keepalive (maintient le watchdog du firmware) +
     // rafraîchit lastStatus(). Perd le poste après plusieurs échecs consécutifs.
-    void poll() {
+    // `intervalMs` : période mini entre deux GET_STATUS (cadence adaptative,
+    // pilotée par pollUvK5 selon la présence d'un signal).
+    void poll(uint32_t intervalMs = RF_MODULE_UVK5_POLL_MS) {
         if (!present_) return;
         uint32_t now = millis();
-        if (now - lastPollMs_ < (uint32_t)RF_MODULE_UVK5_POLL_MS) return;
+        if (now - lastPollMs_ < intervalMs) return;
         lastPollMs_ = now;
         Status s;
         if (getStatus(s)) { last_ = s; fails_ = 0; }

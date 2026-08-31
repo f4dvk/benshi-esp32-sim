@@ -389,9 +389,12 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // analogique (HP du poste -> ADC ESP, DAC ESP -> micro du poste).
 #define RF_MODULE_UVK5_ENABLE     true      // true -> sonde UV-K1 si pas de SA818
 #define RF_MODULE_UVK5_BAUD       38400     // débit série du poste Quansheng
-#define RF_MODULE_UVK5_POLL_MS   100       // période du GET_STATUS série : S-mètre,
-                                           // "signal reçu" (squelch), keepalive du
-                                           // mode hôte. 250 ms = squelch réactif.
+// Période du GET_STATUS série (S-mètre, "signal reçu"/squelch, keepalive du mode
+// hôte). Cadence ADAPTATIVE : POLL_MS quand un signal est présent/récent (suivi
+// S-mètre réactif), IDLE_POLL_MS au repos -> moins de bursts série = moins de
+// rayonnement HF parasite couplé dans le récepteur du poste.
+#define RF_MODULE_UVK5_POLL_MS      250     // signal présent (100..250 ; + bas = + réactif mais + de HF)
+#define RF_MODULE_UVK5_IDLE_POLL_MS 1000    // au repos (>= 500 ; le watchdog hôte est à ~120 s)
 #define RF_MODULE_UVK5_MODULATION 0         // 0 = FM, 1 = AM, 2 = USB (canal Benshi = FM)
 //
 // CABLAGE (5 fils) :

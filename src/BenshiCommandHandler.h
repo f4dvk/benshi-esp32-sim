@@ -308,8 +308,14 @@ public:
 
         // Pas de GET_STATUS pendant l'émission : la RF du PA perturbe la
         // liaison série, la lecture échouerait et ferait "perdre" le poste.
-        if (!pttApplied_)
-            uvk5_->poll();   // GET_STATUS série (RF_MODULE_UVK5_POLL_MS) : S-mètre, squelch, keepalive
+        // Cadence adaptative : rapide seulement quand un signal est présent ou
+        // récent (< 3 s) -> au repos, ~1 burst/s au lieu de ~10 -> moins de
+        // rayonnement HF de la liaison série dans le récepteur du poste.
+        if (!pttApplied_) {
+            bool active = sqOpen_.load() || (millis() - lastSigMs_ < 3000);
+            uvk5_->poll(active ? (uint32_t)RF_MODULE_UVK5_POLL_MS
+                               : (uint32_t)RF_MODULE_UVK5_IDLE_POLL_MS);
+        }
 
         const UvK5::Status& s = uvk5_->lastStatus();
         // Statut périmé (> 1 s : liaison muette) -> on considère "pas de signal"
@@ -317,6 +323,7 @@ public:
         // HTCommander).
         bool stale = (s.stamp == 0) || (millis() - s.stamp > 1000);
         bool rx = !stale && s.sig && !pttApplied_;
+        if (rx) lastSigMs_ = millis();   // -> garde la cadence rapide ~3 s après le signal
         uint8_t r = rx ? (s.sMeter ? s.sMeter : 1) : 0;
 #if AUDIO_DEBUG
         if (millis() - lastUvk5DbgMs_ > 1000) {
@@ -612,6 +619,7 @@ private:
     bool       pttApplied_ = false;
     uint8_t    pttResend_  = 0;             // renvois restants de l'ordre PTT
     uint32_t   lastUvk5DbgMs_ = 0;
+    uint32_t   lastSigMs_ = 0;              // dernier "signal reçu" -> cadence de poll adaptative
 #endif
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré
