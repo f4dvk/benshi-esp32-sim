@@ -387,14 +387,15 @@ private:
                     uint32_t absSum = 0;
                     bool gate = micGateOpen_.load();
 #if AUDIO_AGC_ENABLE
-                    // Nouvelle salve : on repart d'un gain médian (sinon, si une
-                    // salve forte précédente a plaqué le gain à 1, la suivante
-                    // met AUDIO_AGC_RELEASE_MS à revenir audible).
+                    // Nouvelle salve (front d'ouverture du squelch : gatePrev_
+                    // est mis à jour plus bas dans cette même passe) : on repart
+                    // d'un gain médian, sinon si une salve forte précédente a
+                    // plaqué le gain à 1, la suivante met AUDIO_AGC_RELEASE_MS
+                    // à redevenir audible.
                     if (gate && !gatePrev_) {
-                        agcGain_   = (float)AUDIO_MIC_GAIN;
-                        agcEnvPk_  = 0.0f;
+                        agcGain_  = (float)AUDIO_MIC_GAIN;
+                        agcEnvPk_ = 0.0f;
                     }
-                    gatePrev_ = gate;
 #endif
                     for (size_t i = 0; i < cnt; i++) {
                         int raw = adc[i] & 0x0FFF;
@@ -731,7 +732,6 @@ private:
 
     float    micDc_ = 2048.0f;
     float    adcEnv_ = 0.0f;
-    bool     gatePrev_ = false;   // détection front d'ouverture RX (reset AGC)
     float    dacLp_ = 0.0f;
     float    agcGain_ = (float)AUDIO_MIC_GAIN;
     float    agcEnvPk_ = 0.0f;
