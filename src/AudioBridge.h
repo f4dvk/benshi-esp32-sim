@@ -386,6 +386,16 @@ private:
                     size_t cnt = n / sizeof(uint16_t);
                     uint32_t absSum = 0;
                     bool gate = micGateOpen_.load();
+#if AUDIO_AGC_ENABLE
+                    // Nouvelle salve : on repart d'un gain médian (sinon, si une
+                    // salve forte précédente a plaqué le gain à 1, la suivante
+                    // met AUDIO_AGC_RELEASE_MS à revenir audible).
+                    if (gate && !gatePrev_) {
+                        agcGain_   = (float)AUDIO_MIC_GAIN;
+                        agcEnvPk_  = 0.0f;
+                    }
+                    gatePrev_ = gate;
+#endif
                     for (size_t i = 0; i < cnt; i++) {
                         int raw = adc[i] & 0x0FFF;
 #if AUDIO_MIC_DC_TRACK
@@ -721,6 +731,7 @@ private:
 
     float    micDc_ = 2048.0f;
     float    adcEnv_ = 0.0f;
+    bool     gatePrev_ = false;   // détection front d'ouverture RX (reset AGC)
     float    dacLp_ = 0.0f;
     float    agcGain_ = (float)AUDIO_MIC_GAIN;
     float    agcEnvPk_ = 0.0f;
