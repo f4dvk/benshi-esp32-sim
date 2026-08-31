@@ -379,7 +379,7 @@ public:
                 "[DBG] handles cmd=%lu audio=%lu pend=%lu cong=%d | I2S=%s ADC=%luHz clip=%lu | "
                 "RX<-HTC: cmd=%u audioData=%uf/%uo types=0x%03X | "
                 "mic: enc=%u SBC/s -> spp w=%u drop=%u sbuf=%uo | "
-                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu agc=x%.1f heap=%u%s\n",
+                "PTT=%d SQpin=%d RXgate=%d ADClvl=%lu agc=x%.1f heap=%u/%u%s\n",
                 (unsigned long)cmdHandle_, (unsigned long)audioHandle_,
                 (unsigned long)pendingConn_, (int)audioCong_,
                 audio_.txToRadio() ? "DAC(TX)" : "ADC(RX)", (unsigned long)sps, (unsigned long)clip,
@@ -388,7 +388,7 @@ public:
                 (unsigned)(audioTxSb_ ? xStreamBufferBytesAvailable(audioTxSb_) : 0),
                 (int)audio_.txToRadio(), (int)audio_.squelchRaw(),
                 (int)audio_.rxFromRadio(), (unsigned long)audio_.adcLevel(),
-                audio_.agcGain(), (unsigned)ESP.getFreeHeap(),
+                audio_.agcGain(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
 #if TNC_ENABLE
                 tncRunning_ ? " | TNC=DATA(AFSK)" : "");
 #else
@@ -431,6 +431,12 @@ private:
             return;
         }
         bool isEnd = (!payload.empty() && payload[0] == 0x01);
+        // Tas bas -> on jette la trame audio ici aussi (avant framing/queue).
+        // AudioEnd passe toujours (petit, important pour fermer le RX côté appli).
+        if (!isEnd && (ESP.getFreeHeap() < 18000 || ESP.getMaxAllocHeap() < 12000)) {
+            dbgAudioDrop_++;
+            return;
+        }
         lockAudio();
         appendFramedFixed(payload.data(), payload.size());
         audioCoalesceMs_ = millis();
@@ -475,7 +481,7 @@ private:
         // plus gros bloc libre devient trop petit (fragmentation), l'alloc
         // renvoie NULL -> assert fixed_queue_enqueue -> reboot. On préfère
         // jeter des trames audio.
-        if (ESP.getFreeHeap() < 16000 || ESP.getMaxAllocHeap() < 6000) {
+        if (ESP.getFreeHeap() < 18000 || ESP.getMaxAllocHeap() < 12000) {
             lockAudio();
             if (audioTxSb_) xStreamBufferReset(audioTxSb_);
             unlockAudio();
