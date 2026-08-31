@@ -381,7 +381,7 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // HTCommander, comme le mode SA818 mais avec beaucoup plus de contrôle.
 // Réutilise le brochage RF_MODULE_UART_RX / _TX (16 / 17). L'audio reste
 // analogique (HP du poste -> ADC ESP, DAC ESP -> micro du poste).
-#define RF_MODULE_UVK5_ENABLE     false     // true -> sonde UV-K1 si pas de SA818
+#define RF_MODULE_UVK5_ENABLE     true      // true -> sonde UV-K1 si pas de SA818
 #define RF_MODULE_UVK5_BAUD       38400     // débit série du poste Quansheng
 #define RF_MODULE_UVK5_KEEPALIVE_MS 3000    // période du GET_STATUS (watchdog mode hôte)
 #define RF_MODULE_UVK5_MODULATION 0         // 0 = FM, 1 = AM, 2 = USB (canal Benshi = FM)
@@ -394,16 +394,11 @@ static const uint8_t  DEFAULT_REGION      = 0;
 //   masse commune
 // PTT et squelch/RSSI passent par le PORT SERIE (commandes 0x0633 / 0x0634) :
 // AUCUN fil PTT ni SQ. Le pin AUDIO_PTT_GPIO reste piloté (inoffensif, non câblé).
-//
-// A REGLER pour ce mode :
-//   RF_MODULE_SQUELCH -> 0   (capture audio continue ; c'est le POSTE qui fait
-//                            le squelch/CTCSS, via state_.squelch() de HTCommander,
-//                            0 = données/APRS, 1..9 = phonie).
-//   AUDIO_SQ_GPIO peut rester 32 (ignoré pour la capture quand RF_MODULE_SQUELCH=0).
-//
-// Squelch envoyé au poste : state_.squelch() de HTCommander, borné 0..9. Le
-// firmware ferme le HP hors signal ; l'ESP lit le bit "signal reçu" du
-// GET_STATUS pour le S-mètre / is_sq (pollUvK5).
+// La capture audio RX est forcée en continu quand ce mode est actif (le pin
+// AUDIO_SQ_GPIO 32 est ignoré) : c'est le POSTE qui fait le squelch / le gating
+// CTCSS, piloté par state_.squelch() de HTCommander (0 = données/APRS, 1..9 =
+// phonie). L'ESP lit le bit "signal reçu" du GET_STATUS pour le S-mètre / is_sq
+// (pollUvK5). RIEN d'autre à régler.
 
 // Test de sanité de la liaison série (Phase 1) : ne fait RIEN d'autre que
 // sonder le poste et lire le registre BK4819 0x67 (RSSI) toutes les 2 s, en

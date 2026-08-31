@@ -94,10 +94,13 @@ public:
         return cmdOk(0x0632, b, sizeof(b));
     }
 
-    // 0x0633 PTT
+    // 0x0633 PTT — envoi SANS attendre l'ack : le keying du PA peut perturber
+    // la liaison série du poste (RF / courant), et un blocage de plusieurs
+    // centaines de ms dans la boucle Arduino au moment du PTT est risqué.
+    // L'état TX réel se lit dans le GET_STATUS suivant (flag bit 1).
     bool ptt(bool on) {
         uint8_t b = on ? 1 : 0;
-        return cmdOk(0x0633, &b, 1);
+        return link_.sendFrame(0x0633, &b, 1);
     }
 
     // 0x0635 MONITOR (force l'AF ouvert / le coupe)
@@ -117,7 +120,7 @@ public:
         uint16_t rid = 0;
         uint8_t  d[24];
         size_t   n = sizeof(d);
-        if (!link_.command(0x0634, nullptr, 0, rid, d, n, 300) || rid != 0x0634 || n < 11)
+        if (!link_.command(0x0634, nullptr, 0, rid, d, n, 200) || rid != 0x0634 || n < 11)
             return false;
         s.func      = d[0];
         s.rssiRaw   = d[1] | ((uint16_t)d[2] << 8);
@@ -164,7 +167,7 @@ private:
 
     bool cmdOk(uint16_t id, const uint8_t* body, size_t n) {
         uint16_t rid = 0; uint8_t d[8]; size_t rn = sizeof(d);
-        if (!link_.command(id, body, n, rid, d, rn, 400)) return false;
+        if (!link_.command(id, body, n, rid, d, rn, 200)) return false;
         return rid == id && rn >= 1 && d[0] != 0;
     }
 

@@ -616,10 +616,12 @@ private:
 
             // --- Capture ADC -> HTCommander (jamais pendant l'émission) ---
             // Squelch "ouvert en permanence" : soit AUDIO_RX_ALWAYS, soit le
-            // squelch du module réglé à 0 (RF_MODULE_SQUELCH). Comme kv4p-ht :
-            // le pilote pousse TOUJOURS l'audio à l'appli, qui décide. Le pin SQ
-            // matériel n'est alors qu'une indication (RSSI / statut).
-#if AUDIO_RX_ALWAYS || (RF_MODULE_SQUELCH == 0)
+            // squelch du module réglé à 0 (RF_MODULE_SQUELCH), soit le mode
+            // UV-K1 piloté (le POSTE fait le squelch/CTCSS, l'ESP capte en
+            // continu). Comme kv4p-ht : le pilote pousse TOUJOURS l'audio à
+            // l'appli, qui décide. Le pin SQ matériel n'est alors qu'une
+            // indication (RSSI / statut).
+#if AUDIO_RX_ALWAYS || (RF_MODULE_SQUELCH == 0) || RF_MODULE_UVK5_ENABLE
             bool rxGate = channelUp_.load() && !tx;   // capture audio en continu
 #else
             bool rxGate = sqStable && !tx;
