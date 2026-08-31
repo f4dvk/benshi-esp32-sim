@@ -251,12 +251,20 @@ public:
         if (!uvk5_ || !uvk5_->present()) return;
 
         int8_t want = pendingPtt_.load();
-        if (want >= 0 && (bool)want != pttApplied_) {
-            uvk5_->ptt(want != 0);
-            pttApplied_ = (want != 0);
+        if (want >= 0) {
+            if ((bool)want != pttApplied_) {
+                pttApplied_ = (want != 0);
+                // OFF : on répète l'ordre ~2 s (8 polls) : la trame PTT-OFF peut
+                // se perdre à cause de la RF du PA sur la liaison série.
+                pttResend_ = pttApplied_ ? 1 : 8;
+            }
+            if (pttResend_ > 0) {
+                uvk5_->ptt(pttApplied_);
+                pttResend_--;
+            }
         }
 
-        uvk5_->poll();   // keepalive GET_STATUS toutes les ~3 s
+        uvk5_->poll();   // GET_STATUS série (250 ms) : S-mètre, squelch, keepalive
 
         const UvK5::Status& s = uvk5_->lastStatus();
         if (s.stamp == 0 || millis() - s.stamp > 4000) return;   // pas de statut frais
@@ -539,6 +547,7 @@ private:
     UvK5*      uvk5_ = nullptr;
     std::atomic<int8_t> pendingPtt_{-1};   // -1 aucun, 0/1 état PTT demandé
     bool       pttApplied_ = false;
+    uint8_t    pttResend_  = 0;             // renvois restants de l'ordre PTT
 #endif
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré

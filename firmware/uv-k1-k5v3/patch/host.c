@@ -145,7 +145,9 @@ typedef struct __attribute__((__packed__)) {
 // ---- state -----------------------------------------------------------------
 
 #define HOST_WATCHDOG_500MS  240  // ~120 s sans commande hôte -> sortie auto
-                                  // l ESP32 enverra un GET_STATUS toutes les ~3 s
+                                  // l ESP32 enverra un GET_STATUS toutes les ~250 ms
+#define HOST_TX_MAX_500MS    16   // ~8 s d'émission maxi : filet si la trame
+                                  // PTT-OFF se perd (RF du PA sur la liaison série)
 
 static bool     s_active       = false;
 static uint16_t s_watchdog     = 0;
@@ -158,6 +160,7 @@ static bool     s_sqOpen       = false;  // squelch matériel ouvert (sqlLost)
 static bool     s_cssOk        = false;  // ton/code RX détecté
 static bool     s_afOpen       = false;  // état courant du chemin audio
 static bool     s_monitor      = false;  // MONITOR{1} : force l'AF ouvert
+static uint8_t  s_txGuard      = 0;      // compte à rebours anti-émission-bloquée
 
 bool HOST_IsActive(void) { return s_active; }
 
@@ -202,10 +205,16 @@ void HOST_Exit(void)
     RADIO_SetupRegisters(true);
 }
 
+static void HOST_Ptt(uint8_t on);   /* fwd */
+
 void HOST_Tick500ms(void)
 {
     if (!s_active)
         return;
+    // Filet anti-émission-bloquée : si la trame PTT-OFF s'est perdue (RF du PA
+    // sur la liaison série), on coupe au bout de HOST_TX_MAX_500MS.
+    if (gCurrentFunction == FUNCTION_TRANSMIT && s_txGuard > 0 && --s_txGuard == 0)
+        HOST_Ptt(0);
     if (s_watchdog > 0 && --s_watchdog == 0)
         HOST_Exit();
 }
@@ -355,7 +364,9 @@ static void HOST_Ptt(uint8_t on)
             BK4819_ExitSubAu();
         BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, true);
         gCurrentFunction = FUNCTION_TRANSMIT;
+        s_txGuard = HOST_TX_MAX_500MS;
     } else {
+        s_txGuard = 0;
         gCurrentFunction = FUNCTION_FOREGROUND;
         BK4819_SetupPowerAmplifier(0, 0);
         BK4819_ToggleGpioOut(BK4819_GPIO1_PIN29_PA_ENABLE, false);
