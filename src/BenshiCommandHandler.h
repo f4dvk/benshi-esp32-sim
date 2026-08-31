@@ -270,10 +270,20 @@ public:
             uvk5_->poll();   // GET_STATUS série (250 ms) : S-mètre, squelch, keepalive
 
         const UvK5::Status& s = uvk5_->lastStatus();
-        if (s.stamp == 0 || millis() - s.stamp > 4000) return;   // pas de statut frais
-        // is_sq / is_in_rx + S-mètre 0..15 (jamais pendant l'émission).
-        bool rx = s.sig && !pttApplied_;
+        // Statut périmé (> 1 s : liaison muette) -> on considère "pas de signal"
+        // au lieu de garder la dernière valeur (sinon RX resté ouvert dans
+        // HTCommander).
+        bool stale = (s.stamp == 0) || (millis() - s.stamp > 1000);
+        bool rx = !stale && s.sig && !pttApplied_;
         uint8_t r = rx ? (s.sMeter ? s.sMeter : 1) : 0;
+#if AUDIO_DEBUG
+        if (millis() - lastUvk5DbgMs_ > 1000) {
+            lastUvk5DbgMs_ = millis();
+            Serial.printf("[UVK5] func=%u sig=%d smeter=%u dBm=%d batt=%umV%s\n",
+                          s.func, (int)s.sig, s.sMeter, s.rssiDbm, s.batterymV,
+                          stale ? "  (STALE)" : "");
+        }
+#endif
         bool changed = (rx != sqOpen_.load()) || (r != rssi_.load());
         sqOpen_.store(rx);
         rssi_.store(r);
@@ -551,6 +561,7 @@ private:
     std::atomic<int8_t> pendingPtt_{-1};   // -1 aucun, 0/1 état PTT demandé
     bool       pttApplied_ = false;
     uint8_t    pttResend_  = 0;             // renvois restants de l'ordre PTT
+    uint32_t   lastUvk5DbgMs_ = 0;
 #endif
 
     uint16_t registeredMask_ = 0;   // bit t = type de notification t enregistré

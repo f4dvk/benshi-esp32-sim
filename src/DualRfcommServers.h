@@ -301,8 +301,9 @@ public:
 #if RF_MODULE_UVK5_ENABLE
         // Mode UV-K1 piloté : la capture RX suit le "signal reçu" du poste
         // (bit SIG du GET_STATUS série, poussé dans sqOpen_ par pollUvK5).
-        if (uvk5_ && uvk5_->present())
-            audio_.setRxAllow(handler_.sqOpen());
+        // Poste absent / lien muet -> capture fermée (pas de RX permanent).
+        if (uvk5_)
+            audio_.setRxAllow(uvk5_->present() && handler_.sqOpen());
 #endif
         flushAudioCoalesce();
 #if TNC_ENABLE
