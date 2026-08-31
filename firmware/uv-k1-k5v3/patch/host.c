@@ -201,7 +201,8 @@ static void HOST_Enter(void)
     FUNCTION_Select(FUNCTION_FOREGROUND);
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);
-    HOST_OpenAudio();
+    s_sqOpen = s_cssOk = false;
+    HOST_MuteAudio();   // HOST_Tick10ms ouvre juste après (s_squelch initial = 0 -> forcé)
 }
 
 void HOST_Exit(void)
@@ -265,20 +266,28 @@ static void HOST_ApplyAudioFilters(void)
     BK4819_WriteRegister(BK4819_REG_2B, reg2b);
 }
 
+// APP_StartListening() : fonction RX du firmware stock (non déclarée dans app.h).
+extern void APP_StartListening(FUNCTION_Type_t function);
+// BK4819_RX_TurnOn() : REG_30/REG_37 = DSP RX actif (pas dans bk4819.h).
+extern void BK4819_RX_TurnOn(void);
+
 static void HOST_OpenAudio(void)
 {
-    // La modulation / l'AGC / les filtres sont déjà configurés par HOST_ApplyVfo
-    // (-> RADIO_SetupRegisters -> RADIO_SetModulation). Ici on ne fait QUE lever
-    // le mute AF : un RADIO_SetModulation complet à chaque ouverture de squelch
-    // reprogramme tout le BK4819 (~50-100 ms de glitch/silence) -> l'audio
-    // "arrive en retard" à chaque salve, ce que le SA818 (audio ligne continu)
-    // n'a pas.
-    BK4819_SetAF((gRxVfo && gRxVfo->Modulation == MODULATION_USB)
-                 ? BK4819_AF_BASEBAND2 : BK4819_AF_FM);
-    BK4819_SetRxAudioGain();
-    HOST_ApplyAudioFilters();
-    AUDIO_AudioPathOn();
-    gEnableSpeaker = true;
+    // Le DSP RX du BK4819 (REG_30) n'est ré-armé par RIEN dans le flux mode hôte
+    // (RADIO_SetupRegisters ne le fait pas ; BK4819_TxOn_Beep le passe en config
+    // TX à chaque PTT). Sans DSP RX, le discriminateur ne sort rien -> pas de
+    // souffle en squelch 0. On le force ici.
+    BK4819_ToggleGpioOut(BK4819_GPIO0_PIN28_RX_ENABLE, true);
+    BK4819_RX_TurnOn();
+    // H25 : on appelle DIRECTEMENT la fonction RX du firmware stock. Nos essais
+    // (BK4819_SetAF seul H17, RADIO_SetModulation H23) ne routaient pas le
+    // discriminateur sans porteuse (squelch 0 / monitor = silence). APP_StartListening
+    // fait, en plus, FUNCTION_Select(FUNCTION_RECEIVE/MONITOR) + gEnableSpeaker +
+    // AUDIO_AudioPathOn dans le bon ordre. FUNCTION_MONITOR quand le squelch est
+    // ouvert en permanence (0 / monitor) : le firmware traite alors le squelch
+    // comme désactivé.
+    APP_StartListening((s_squelch == 0 || s_monitor) ? FUNCTION_MONITOR : FUNCTION_RECEIVE);
+    HOST_ApplyAudioFilters();   // APP_StartListening -> RADIO_SetModulation : on garantit l'audio plat
     s_afOpen = true;
 }
 
@@ -287,6 +296,8 @@ static void HOST_MuteAudio(void)
     gEnableSpeaker = false;
     AUDIO_AudioPathOff();
     BK4819_SetAF(BK4819_AF_MUTE);
+    if (gCurrentFunction != FUNCTION_TRANSMIT)
+        gCurrentFunction = FUNCTION_FOREGROUND;   // symétrique d'APP_StartListening
     s_afOpen = false;
 }
 
@@ -362,10 +373,11 @@ void HOST_Tick10ms(void)
     // 1 = CTCSS conforme, 2 = CDCSS conforme, 0 = aucun.
     s_cssOk = s_cssRequired ? (BK4819_GetCTCType() != 0) : true;
 
-    if (s_squelch == 0 || s_monitor)
-        return;   // AF déjà forcé ouvert, pas de gating
-
-    const bool want = s_sqOpen && (!s_cssRequired || s_cssOk);
+    // Squelch 0 / monitor -> AF toujours ouvert ; sinon gate squelch + CTCSS.
+    // Tout passe par le MÊME HOST_OpenAudio()/HOST_MuteAudio() depuis le tick
+    // (le seul chemin dont on a la preuve qu'il produit de l'audio).
+    const bool want = (s_squelch == 0 || s_monitor)
+                    || (s_sqOpen && (!s_cssRequired || s_cssOk));
     if (want != s_afOpen) {
         if (want) HOST_OpenAudio();
         else      HOST_MuteAudio();
@@ -417,10 +429,10 @@ static void HOST_ApplyVfo(const HOST_SetVfo_t *c)
     HOST_ApplyAudioFilters();                  // apres RADIO_SetupRegisters (qui remet REG_2B a 0)
 
     s_sqOpen = s_cssOk = false;
-    if (s_squelch == 0)
-        HOST_OpenAudio();      // données : AF permanent
-    else
-        HOST_MuteAudio();      // phonie : fermé, HOST_Tick10ms ouvrira sur signal
+    // On ferme, et c'est HOST_Tick10ms qui ouvre : squelch 0 / monitor -> tout de
+    // suite (want forcé), phonie -> sur signal. Passer par le MÊME chemin que le
+    // cas qui marche (tick), après stabilisation du BK4819 post-retune.
+    HOST_MuteAudio();
 }
 
 static void HOST_SetRadio(const HOST_SetRadio_t *c)
@@ -443,6 +455,10 @@ static void HOST_SetRadio(const HOST_SetRadio_t *c)
 
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);
+    // RADIO_SetupRegisters vient de couper l'AF au niveau matériel : on remet
+    // l'état logiciel cohérent (fermé) pour que HOST_Tick10ms rouvre.
+    s_sqOpen = s_cssOk = false;
+    HOST_MuteAudio();
 }
 
 // Keying PA minimal, sans passer par RADIO_PrepareTX / FUNCTION_Transmit :
@@ -490,24 +506,16 @@ static void HOST_Ptt(uint8_t on)
         BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, false);
         RADIO_SetupRegisters(true);
         HOST_ApplyAudioFilters();
-        if (s_squelch == 0 || s_monitor) {
-            HOST_OpenAudio();
-        } else {
-            HOST_MuteAudio();
-            s_sqOpen = s_cssOk = false;   // HOST_Tick10ms rouvrira sur signal
-        }
+        HOST_MuteAudio();
+        s_sqOpen = s_cssOk = false;       // HOST_Tick10ms rouvre (forcé si sq0/monitor, sinon sur signal)
     }
 }
 
 static void HOST_Monitor(uint8_t on)
 {
     s_monitor = on ? true : false;
-    if (on) {
-        HOST_OpenAudio();               // force l'AF ouvert (bouton "monitor")
-    } else {
-        HOST_MuteAudio();
-        s_sqOpen = s_cssOk = false;     // phonie : HOST_Tick10ms rouvrira sur signal
-    }
+    if (!on) s_sqOpen = s_cssOk = false;
+    // HOST_Tick10ms applique (want forcé si monitor, sinon gate sur signal).
 }
 
 static void HOST_RecallChannel(const HOST_RecallCh_t *c)
@@ -518,6 +526,8 @@ static void HOST_RecallChannel(const HOST_RecallCh_t *c)
     RADIO_ConfigureChannel(vi, VFO_CONFIGURE_RELOAD);
     RADIO_SelectVfos();
     RADIO_SetupRegisters(true);
+    s_sqOpen = s_cssOk = false;
+    HOST_MuteAudio();   // le tick rouvre (cf. HOST_SetRadio)
 }
 
 static void HOST_SendStatus(uint32_t Port)
@@ -539,9 +549,14 @@ static void HOST_SendStatus(uint32_t Port)
     st.ctcssType = BK4819_GetCTCType();
     st.batterymV = (uint16_t)(gBatteryVoltageAverage * 10);   // 10 mV -> mV
     // b0 mode hôte actif, b1 en TX, b2 monitor forcé, b3 signal reçu présent
-    // (squelch ouvert + ton/code RX OK) -> l'ESP32 le mappe sur is_sq.
+    // -> l'ESP32 le mappe sur is_sq et l'utilise pour ouvrir la capture RX.
     // b4 VFO RX courant (0/1), b5 double veille active (-> écran de façade).
-    const bool sig = s_sqOpen && (!s_cssRequired || s_cssOk);
+    // En squelch 0 / monitor l'AF est forcé ouvert (HOST_OpenAudio) mais aucun
+    // front d'interruption squelch ne met s_sqOpen à 1 sans porteuse -> on
+    // reporte s_afOpen, sinon l'ESP ne capture jamais (pas de souffle récepteur).
+    const bool sig = (s_squelch == 0 || s_monitor)
+                   ? s_afOpen
+                   : (s_sqOpen && (!s_cssRequired || s_cssOk));
     st.flags     = (uint8_t)((s_active ? 1 : 0)
                  | ((gCurrentFunction == FUNCTION_TRANSMIT) ? 2 : 0)
                  | (s_monitor ? 4 : 0)

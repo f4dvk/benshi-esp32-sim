@@ -172,20 +172,37 @@ cmake --build build/Fusion -j
   directement + `RADIO_SetupRegisters(false)`, comme `DualwatchAlternate()` du
   stock. Vérifier au rebase : `gEeprom.RX_VFO` / `gRxVfo` /
   `RADIO_SelectVfos` (test `DUAL_WATCH`) / `DUAL_WATCH_CHAN_A/B`.
-- **Squelch 0 = AF permanent (H20)** : `HOST_ApplyVfo` écrit `gEeprom.SQUELCH_LEVEL`
+- **Squelch 0 = AF permanent (H20, H22, H24)** : `HOST_ApplyVfo` écrit `gEeprom.SQUELCH_LEVEL`
   **toujours**, y compris 0. Avant (`if (s_squelch) …`) un niveau précédent
   restait actif -> le squelch matériel du BK4819 coupait quand même l'AF en mode
   « données » (squelch 0). `SQUELCH_LEVEL` du menu est sauvé/restauré par
   `HOST_Enter`/`HOST_Exit` (`s_savedSquelch`).
-- **`HOST_OpenAudio` léger (H17)** : ne fait QUE lever le mute AF
-  (`BK4819_SetAF`), pas un `RADIO_SetModulation` complet. Un
-  `RADIO_SetModulation` à chaque ouverture de squelch reprogramme tout le
-  BK4819 (~50-100 ms de silence/glitch) → l'audio « arrive en retard » à chaque
-  salve en mode hôte, ce que le SA818 (ligne audio continue) n'a pas. La
-  modulation/AGC/filtres restent posés par `HOST_ApplyVfo`
-  (→ `RADIO_SetupRegisters` → `RADIO_SetModulation`), une fois par retune.
-  (H16 avait tenté de figer l'AGC RX `BK4819_SetAGC(false)` — abandonné, l'AGC
-  du poste n'était pas en cause.)
+  **H22** : `HOST_SendStatus` reporte `s_afOpen` (pas `s_sqOpen`) dans le flag
+  `sig` en squelch 0 / monitor — sans porteuse, aucun front d'interruption ne met
+  `s_sqOpen` à 1, donc l'ESP ne capturait jamais (pas de souffle récepteur).
+  **H24** : squelch 0 / monitor passent par le MÊME HOST_OpenAudio() depuis
+  HOST_Tick10ms (want forcé) que le cas squelch > 0 — HOST_ApplyVfo/Enter/Ptt
+  ferment et laissent le tick ouvrir, après stabilisation du BK4819.
+  **H25** : HOST_OpenAudio appelle directement APP_StartListening() du firmware
+  stock (FUNCTION_RECEIVE, ou FUNCTION_MONITOR si squelch 0/monitor) — nos
+  reconstructions manuelles (BK4819_SetAF, RADIO_SetModulation) ne routaient pas
+  le discriminateur sans porteuse.
+  **H26** : + BK4819_RX_TurnOn() (REG_30/37 = DSP RX) en tête de HOST_OpenAudio —
+  rien ne le ré-arme dans le flux hôte, et BK4819_TxOn_Beep le passe en config TX
+  à chaque PTT ; sans lui le discriminateur ne sort rien.
+  **H27** : HOST_SetRadio / HOST_RecallChannel appellent HOST_MuteAudio() après
+  leur RADIO_SetupRegisters(true) — sinon l'AF est coupé au matériel mais s_afOpen
+  reste vrai -> HOST_Tick10ms ne rouvre jamais (audio bloqué muet en squelch 0,
+  car pas de balayage pour débloquer). C'était LE bug "l'ESP n'envoie pas les
+  bonnes commandes" : le SET_RADIO de l'ESP (absent de l'outil Python) cassait tout.
+- **`HOST_OpenAudio` (H23)** : reprend la séquence de `APP_StartListening()` du
+  firmware stock — `BK4819_SetRxAudioGain()` + **`RADIO_SetModulation(gRxVfo->Modulation)`**
+  + `AUDIO_AudioPathOn()` + `gEnableSpeaker`. Un simple `BK4819_SetAF()` (essai
+  H17) ne route PAS le discriminateur quand il n'y a pas de porteuse : squelch 0
+  / monitor donnaient un silence au lieu du souffle récepteur. La « latence
+  audio » qui avait motivé H17 était en fait le condensateur d'entrée ADC sans
+  résistance de polarisation (charge RC très lente), pas le `RADIO_SetModulation`.
+  (H16 avait aussi tenté de figer l'AGC RX `BK4819_SetAGC(false)` — abandonné.)
 
 ## Points à revérifier lors d'un rebase F4HWN
 

@@ -50,7 +50,7 @@ firmware/uv-k1-k5v3/
 ```
 
 Nom de fichier : `v<version amont>.H<HOST_PROTO_VER>-<commit court>` — p. ex.
-`…-hostmode-v5.9.0.H21-435192e.bin`. Le `.H<n>` apparaît aussi **à l'écran de la
+`…-hostmode-v5.9.0.H27-435192e.bin`. Le `.H<n>` apparaît aussi **à l'écran de la
 radio** et dans la réponse série. Publier le SHA‑256 à côté.
 
 ---
@@ -107,7 +107,7 @@ prise série jack.
 
 **Vérifier que c'est bien CE firmware** (et pas le F4HWN stock de même version) :
 
-- **à l'écran** : la version affichée est `F4HWN v5.9.0.H21` (suffixe `.H<n>` =
+- **à l'écran** : la version affichée est `F4HWN v5.9.0.H27` (suffixe `.H<n>` =
   révision du patch mode hôte = `HOST_PROTO_VER`). Le stock affiche `F4HWN v5.9.0`.
 - **par le port série** : `tools/uvk5_host.py <port> check` — seul ce firmware
   répond à `0x0630` ; il renvoie `proto H<n>` + la chaîne de version.
