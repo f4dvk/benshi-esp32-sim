@@ -56,6 +56,10 @@ public:
     // Autorisation de capture RX (mode UV-K1 piloté : suit le "signal reçu" du
     // GET_STATUS série ; par défaut true = pas de gating externe).
     void setRxAllow(bool a)      { rxAllow_.store(a); }
+    // true = un poste UV-K1 piloté fait le squelch (rxAllow_ suit le GET_STATUS
+    // série) ; false = squelch matériel via le pin SQ (SA818). Réglé au boot
+    // selon le module détecté -> le build "UV-K1" ne casse plus le SA818.
+    void setExternalSquelch(bool e) { extSquelch_.store(e); }
 
     // --- Mode données (canal APRS) : l'audio ne passe plus par le SBC mais par
     //     le TNC. L'ADC est routé vers dataRxCb_, le DAC est alimenté par
@@ -397,6 +401,19 @@ private:
                         agcEnvPk_ = 0.0f;
                     }
 #endif
+#if AUDIO_MIC_DC_TRACK
+                    // Front d'ouverture du squelch : recale l'estimateur DC sur
+                    // le niveau réel du bloc courant. Sinon il repart de sa
+                    // dernière valeur (ou 2048) et met ~100 ms à converger (le
+                    // filtre est lent, tau ~20 ms) -> le début du message passe
+                    // décalé / atténué / écrêté. Vaut surtout après une émission
+                    // (bascule TX->RX) ou au 1er signal après le boot.
+                    if (gate && !gatePrev_ && cnt) {
+                        uint32_t dcSum = 0;
+                        for (size_t i = 0; i < cnt; i++) dcSum += (uint32_t)(adc[i] & 0x0FFF);
+                        micDc_ = (float)dcSum / (float)cnt;
+                    }
+#endif
                     for (size_t i = 0; i < cnt; i++) {
                         int raw = adc[i] & 0x0FFF;
 #if AUDIO_MIC_DC_TRACK
@@ -635,11 +652,17 @@ private:
             // continu). Comme kv4p-ht : le pilote pousse TOUJOURS l'audio à
             // l'appli, qui décide. Le pin SQ matériel n'est alors qu'une
             // indication (RSSI / statut).
-#if AUDIO_RX_ALWAYS || (RF_MODULE_SQUELCH == 0) || RF_MODULE_UVK5_ENABLE
-            // Capture "en continu" MAIS soumise à rxAllow_ : en mode UV-K1
-            // piloté, le transport la ferme quand le GET_STATUS série dit
-            // "pas de signal" (sinon HTCommander voit du RX en permanence).
+#if AUDIO_RX_ALWAYS || (RF_MODULE_SQUELCH == 0)
+            // Capture "en continu" MAIS soumise à rxAllow_.
             bool rxGate = channelUp_.load() && !tx && rxAllow_.load();
+#elif RF_MODULE_UVK5_ENABLE
+            // Build "UV-K1" : si un poste piloté est présent (extSquelch_), le
+            // POSTE fait le squelch/CTCSS et rxAllow_ suit son GET_STATUS série.
+            // Sinon (SA818, ou aucun module) -> on retombe sur le pin SQ matériel,
+            // sinon le SA818 streame en permanence (rxAllow_ jamais mis à jour).
+            bool rxGate = extSquelch_.load()
+                          ? (channelUp_.load() && !tx && rxAllow_.load())
+                          : (sqStable && !tx);
 #else
             bool rxGate = sqStable && !tx;
 #endif
@@ -724,6 +747,7 @@ private:
     std::atomic<bool>     sqDbg_{false};        // état brut du squelch (trace)
     std::atomic<bool>     channelUp_{false};    // canal RFCOMM audio connecté
     std::atomic<bool>     rxAllow_{true};       // gating RX externe (UV-K1 piloté)
+    std::atomic<bool>     extSquelch_{false};   // true = squelch fait par le poste UV-K1 (sinon pin SQ)
     std::atomic<uint32_t> encFrames_{0};        // trames SBC produites par txLoop
     std::atomic<uint32_t> adcSamples_{0};       // echantillons ADC lus (=> Hz reel)
     std::atomic<uint32_t> micClip_{0};          // echantillons ADC ecretes

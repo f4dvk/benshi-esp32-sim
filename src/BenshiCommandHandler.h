@@ -226,6 +226,10 @@ public:
         p.power = rf.tx_at_max_power ? 7 /*HIGH*/ : 4 /*LOW4*/;
         int sql = state_.squelch();  if (sql < 0) sql = 0;  if (sql > 9) sql = 9;
         p.squelch = (uint8_t)sql;
+        // Audio plat : on suit le bit pre_de_emph_bypass du canal, comme pour le
+        // SA818 (rf_->setFilters). Le poste bypasse alors pré/dé-emphase + HPF/LPF
+        // AF + compander -> AFSK/APRS non déformé sur le canal données.
+        p.flatAudio = rf.emph_bypass;
         return p;
     }
 
@@ -267,7 +271,7 @@ public:
         // Pas de GET_STATUS pendant l'émission : la RF du PA perturbe la
         // liaison série, la lecture échouerait et ferait "perdre" le poste.
         if (!pttApplied_)
-            uvk5_->poll();   // GET_STATUS série (250 ms) : S-mètre, squelch, keepalive
+            uvk5_->poll();   // GET_STATUS série (RF_MODULE_UVK5_POLL_MS) : S-mètre, squelch, keepalive
 
         const UvK5::Status& s = uvk5_->lastStatus();
         // Statut périmé (> 1 s : liaison muette) -> on considère "pas de signal"
@@ -521,6 +525,14 @@ public:
 
     void emitHtStatusChanged() {
         if (!sink_) return;
+#if AUDIO_DEBUG
+        Serial.printf("[HTSTATUS] -> HTCommander : is_sq/is_in_rx=%d is_in_tx=%d rssi=%u "
+                      "aoc=%d (masque 0x%04X, HT_STATUS_CHANGED %s)\n",
+                      sqOpen_.load() ? 1 : 0, inTx_.load() ? 1 : 0, rssi_.load(),
+                      aocConnected_.load() ? 1 : 0, registeredMask_,
+                      (registeredMask_ & (1u << EventType::HT_STATUS_CHANGED)) ? "enregistre"
+                                                                              : "NON enregistre");
+#endif
         if (!(registeredMask_ & (1u << EventType::HT_STATUS_CHANGED))) return;
         BenshiMessage m;
         m.command_group = CommandGroup::BASIC;

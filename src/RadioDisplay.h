@@ -194,7 +194,10 @@ private:
         // ---- barre haute : n° canal + nom | H/L +/- CTCSS | BT | GPS ----
         if (F || f.channelId != c_.channelId || strcmp(f.channel, c_.channel)) {
             char s[16]; snprintf(s, sizeof(s), "%02u %s", f.channelId, f.channel);
-            tft_.fillRect(0, BAR_Y, 76, 8, BG);
+            // "NN " + nom 10 car. = 13 car. x 6 px + marge x=4 -> ~82 px : il faut
+            // effacer jusqu'au bloc H/L (x=100), sinon la dernière lettre d'un nom
+            // long (ex. "St_GobainV") reste affichée quand on passe à un nom court.
+            tft_.fillRect(0, BAR_Y, 98, 8, BG);
             tft_.text(4, BAR_Y, s, AMBER, BG, 1);
         }
         if (F || f.highPower != c_.highPower || f.shift != c_.shift || f.tone != c_.tone) {

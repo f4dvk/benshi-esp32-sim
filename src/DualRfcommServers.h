@@ -63,6 +63,10 @@ public:
         handler_.setUvK5(uvk5);
         rf_ = rf;
         uvk5_ = uvk5;
+        // Squelch de la capture RX : piloté par le poste (rxAllow_ <- GET_STATUS
+        // série) SEULEMENT si un poste UV-K1 a été détecté. Sinon (SA818, ou
+        // aucun module) on garde le gating par le pin SQ matériel d'AudioBridge.
+        audio_.setExternalSquelch(uvk5 != nullptr);
 #else
     bool begin(Sa818* rf = nullptr) {
         instance_ = this;
@@ -918,6 +922,7 @@ private:
     uint8_t  beaconRestoreCh_ = 0xFF;            // canal à restaurer après balise (0xFF = rien)
     uint8_t  beaconDispCh_ = 0xFF;               // canal réellement utilisé pour la balise (écran)
     uint32_t beaconTxStartMs_ = 0;
+    uint32_t beaconHoldUntilMs_ = 0;             // != 0 : TNC maintenu allumé pour une balise autonome
 #if APRS_GPS_ENABLE
     GpsNmea gps_;
 #endif
@@ -1023,16 +1028,22 @@ private:
                       (millis() - connUpSinceMs_ >= (uint32_t)TNC_START_DELAY_MS);
         bool clientish = (cmdHandle_ != 0 || pendingConn_ != 0);
 
-        // Le modem tourne pour : le canal DONNÉES APRS (client), OU la balise
-        // autonome activée ("Partager ma position") -> celle-ci peut émettre
-        // même si la radio écoute un autre canal (elle bascule sur le canal de
-        // balise le temps de la trame, cf auto_share_loc_ch).
+        // Le modem tourne pour : le canal DONNÉES APRS, OU une balise autonome
+        // EN COURS. La balise ne maintient plus le TNU en permanence : quand une
+        // trame devient due (voir aprsBeaconTick), elle arme beaconHoldUntilMs_,
+        // le modem démarre le temps de moduler + basculer/restaurer le canal,
+        // puis il est relâché. En phonie (canal != "APRS") le TNC est donc
+        // absent -> ~15 ko + 2 tâches rendus, pas de flux SBC continu.
+        bool beaconHold = false;
 #if APRS_BEACON_ENABLE
-        bool beaconWanted = handler_.aprsConfig().shouldShareLocation();
-#else
-        bool beaconWanted = false;
+        if (beaconHoldUntilMs_ != 0) {
+            if ((int32_t)(millis() - beaconHoldUntilMs_) < 0 || tnc_.transmitting())
+                beaconHold = true;
+            else
+                beaconHoldUntilMs_ = 0;
+        }
 #endif
-        bool need = dataChanActive_ || beaconWanted;
+        bool need = dataChanActive_ || beaconHold;
 
         // Décision :
         //  - ni données ni balise           -> non
@@ -1056,27 +1067,66 @@ private:
         audio_.setDataMode(tncRunning_);
     }
 
+    // Vrai si une balise autonome doit partir maintenant (partage activé,
+    // intervalle écoulé, pas de doublon avec HTCommander). Ne modifie rien ->
+    // appelable même modem arrêté, pour décider de le rallumer.
+    bool beaconDue() {
+#if APRS_BEACON_ENABLE
+        if (!handler_.aprsConfig().shouldShareLocation()) return false;
+        // Connecté : on ne balise que si HTCommander a délégué (File > GPS ->
+        // POSITION_CHANGE). Sinon c'est lui qui balise -> pas de doublon.
+        bool clientHere = (cmdHandle_ != 0 || pendingConn_ != 0);
+        if (clientHere && !handler_.positionShareWanted()) return false;
+        uint32_t now = millis();
+        if (lastBeaconMs_ == 0) {
+#if APRS_BEACON_AT_BOOT
+            return now >= 30000;                 // 1re balise ~30 s après boot
+#else
+            return false;                        // compteur démarré par aprsBeaconTick
+#endif
+        }
+        return (now - lastBeaconMs_) >= (uint32_t)handler_.aprsConfig().intervalSec() * 1000UL;
+#else
+        return false;
+#endif
+    }
+
+    static bool beaconCallsignOk(const String& c) {
+        return c.length() != 0 && c != "NOCALL" && c != "N0CALL";
+    }
+
     // Balise APRS autonome : trame de position générée par l'ESP, poussée dans
-    // la file du modem. Émet si "Partager ma position" est coché, quel que soit
-    // le canal écouté (bascule sur le canal de balise le temps de la trame).
+    // la file du modem. Le TNC n'est plus maintenu en permanence : quand une
+    // trame devient due on arme beaconHoldUntilMs_, tncReconcile démarre le
+    // modem, la trame part au poll suivant, puis le modem est relâché.
     void aprsBeaconTick() {
 #if APRS_BEACON_ENABLE
-        if (!tncRunning_ || !tncTxQ_) return;
-        // Connecté : on balise seulement si HTCommander a délégué le balisage à
-        // la radio (File > GPS -> il enregistre POSITION_CHANGE). Sinon c'est
-        // lui qui balise -> on se tait pour éviter le doublon.
-        bool clientHere = (cmdHandle_ != 0 || pendingConn_ != 0);
-        bool delegated  = handler_.positionShareWanted();
-        if (clientHere && !delegated) return;
-
+#if !APRS_BEACON_AT_BOOT
+        if (lastBeaconMs_ == 0) lastBeaconMs_ = millis();   // démarre le compteur d'intervalle
+#endif
         AprsConfig& cfg = handler_.aprsConfig();
 
-        // "Partager ma position" (onglet Beacon de HTCommander) = bit
-        // shouldShareLocation du BSS, conservé en NVS. Décoché -> AUCUNE
-        // émission APRS, y compris en mode autonome (sans application).
-        if (!cfg.shouldShareLocation()) {
+        // Modem arrêté (phonie, canal != "APRS") : si une trame est due, on
+        // tient la carte HTCommander à jour et, si l'indicatif est réglé, on
+        // arme le maintien du TNC ; la trame partira au poll suivant.
+        if (!tncRunning_ || !tncTxQ_) {
+            if (beaconDue()) {
+                double la = cfg.lat(), lo = cfg.lon();
+#if APRS_GPS_ENABLE
+                gps_.fix(la, lo);
+#endif
+                handler_.emitPositionChanged(AprsConfig::degToRaw(la), AprsConfig::degToRaw(lo));
+                if (beaconCallsignOk(cfg.callsign()))
+                    beaconHoldUntilMs_ = millis() + 20000;
+                else
+                    lastBeaconMs_ = millis();   // évite de ré-évaluer à chaque tick
+            }
+            return;
+        }
+
+        if (!beaconDue()) {
             static uint32_t warnMs = 0;
-            if (millis() - warnMs > 120000UL) {
+            if (!cfg.shouldShareLocation() && millis() - warnMs > 120000UL) {
                 warnMs = millis();
                 Serial.println("[APRS] \"Partager ma position\" desactive (BSS) -> pas de balise");
             }
@@ -1084,15 +1134,8 @@ private:
         }
 
         uint32_t now = millis();
-        uint32_t period = (uint32_t)cfg.intervalSec() * 1000UL;   // réglé dans HTCommander (BSS)
-        bool due = (lastBeaconMs_ != 0) && (now - lastBeaconMs_ >= period);
-#if APRS_BEACON_AT_BOOT
-        if (lastBeaconMs_ == 0 && now >= 30000) due = true;   // 1re balise ~30 s après boot
-#else
-        if (lastBeaconMs_ == 0) { lastBeaconMs_ = now; }      // démarre le compteur
-#endif
-        if (!due) return;
         lastBeaconMs_ = now;
+        beaconHoldUntilMs_ = now + 20000;   // garde le TNC le temps de moduler + restaurer le canal
 
         // Position : GPS si fix récent, sinon position fixe (réglée dans HTCommander).
         double lat = cfg.lat(), lon = cfg.lon();
@@ -1104,17 +1147,14 @@ private:
         handler_.emitPositionChanged(AprsConfig::degToRaw(lat), AprsConfig::degToRaw(lon));
 
         // Indicatif non configuré -> pas d'émission RF (évite de baliser "NOCALL").
-        {
-            String c = cfg.callsign();
-            if (c.length() == 0 || c == "NOCALL" || c == "N0CALL") {
-                static uint32_t warnMs = 0;
-                if (millis() - warnMs > 60000UL) {
-                    warnMs = millis();
-                    Serial.println("[APRS] indicatif non configure -> balise RF desactivee "
-                                   "(regle APRS_CALLSIGN ou l'indicatif dans HTCommander)");
-                }
-                return;
+        if (!beaconCallsignOk(cfg.callsign())) {
+            static uint32_t warnMs = 0;
+            if (millis() - warnMs > 60000UL) {
+                warnMs = millis();
+                Serial.println("[APRS] indicatif non configure -> balise RF desactivee "
+                               "(regle APRS_CALLSIGN ou l'indicatif dans HTCommander)");
             }
+            return;
         }
 
         // Identité + icône + message : lus du BSS (réglés dans HTCommander).

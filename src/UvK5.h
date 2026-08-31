@@ -33,6 +33,8 @@ public:
         uint8_t power = 7;        // OUTPUT_POWER_* : 7 = HIGH, 6 = MID, 1..5 = LOW
         uint8_t squelch = 0;      // 0 = AF permanent (données) ; 1..9 = phonie
         uint8_t modulation = RF_MODULE_UVK5_MODULATION;   // 0 FM, 1 AM, 2 USB
+        bool    flatAudio = false; // true = bypass pré/dé-emphase + HPF/LPF AF +
+                                   // compander (AFSK/APRS) ; = bit emph_bypass du canal
     };
 
     struct Status {
@@ -73,7 +75,7 @@ public:
         uint8_t rxCT = 0, rxCode = 0, txCT = 0, txCode = 0;
         if (p.rxCtcssHz > 1.0) { rxCT = 1; rxCode = ctcssIdx(p.rxCtcssHz); }
         if (p.txCtcssHz > 1.0) { txCT = 1; txCode = ctcssIdx(p.txCtcssHz); }
-        uint8_t b[19];
+        uint8_t b[20];
         b[0] = vfo & 1;
         wr32(b + 1, rxF);
         wr32(b + 5, txF);
@@ -84,6 +86,7 @@ public:
         b[14] = txCT; b[15] = txCode;
         b[16] = 0; b[17] = 0;            // step (0 = inchangé)
         b[18] = p.squelch;
+        b[19] = p.flatAudio ? 0x01 : 0x00;   // flags b0 : audio plat (firmware >= H15)
         return cmdOk(0x0631, b, sizeof(b));
     }
 
