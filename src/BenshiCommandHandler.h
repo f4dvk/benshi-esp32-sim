@@ -264,7 +264,10 @@ public:
             }
         }
 
-        uvk5_->poll();   // GET_STATUS série (250 ms) : S-mètre, squelch, keepalive
+        // Pas de GET_STATUS pendant l'émission : la RF du PA perturbe la
+        // liaison série, la lecture échouerait et ferait "perdre" le poste.
+        if (!pttApplied_)
+            uvk5_->poll();   // GET_STATUS série (250 ms) : S-mètre, squelch, keepalive
 
         const UvK5::Status& s = uvk5_->lastStatus();
         if (s.stamp == 0 || millis() - s.stamp > 4000) return;   // pas de statut frais

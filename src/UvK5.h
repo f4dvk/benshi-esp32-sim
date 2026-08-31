@@ -146,7 +146,7 @@ public:
         lastPollMs_ = now;
         Status s;
         if (getStatus(s)) { last_ = s; fails_ = 0; }
-        else if (++fails_ >= 5) {
+        else if (++fails_ >= 40) {    // ~10 s d'échecs (tolère la RF pendant un TX voisin)
             present_ = false;
             Serial.println("[UVK5] poste perdu (pas de reponse GET_STATUS)");
         }
