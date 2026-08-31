@@ -44,6 +44,8 @@ public:
         uint8_t  sMeter = 0;      // 0..15 (mappé comme kv4p-ht)
         bool     sig = false;     // signal reçu présent (squelch + CTCSS OK)
         bool     tx = false;
+        uint8_t  rxVfo = 0;       // VFO en cours de réception (0/1), utile en double veille
+        bool     dualWatch = false; // double veille active côté poste
         uint16_t batterymV = 0;
         uint32_t stamp = 0;       // millis() de la dernière lecture réussie
     };
@@ -131,6 +133,8 @@ public:
         uint8_t flg = d[10];
         s.tx        = (flg & 2) != 0;
         s.sig       = (flg & 8) != 0;
+        s.rxVfo     = (flg >> 4) & 1;      // firmware >= H18
+        s.dualWatch = (flg & 0x20) != 0;   // firmware >= H18
         s.batterymV = d[8] | ((uint16_t)d[9] << 8);
         // S-mètre 0..15 à partir du RSSI brut (plancher ~ -135 dBm, +6 dB / cran).
         int sm = (s.rssiDbm + 135) / 6;

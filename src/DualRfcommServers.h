@@ -246,7 +246,7 @@ public:
         strlcpy(f.channel, handler_.activeChannelName().c_str(), sizeof(f.channel));
         f.wide      = rf.wide;
         f.highPower = rf.tx_at_max_power;
-        f.sMeter    = (uint8_t)((handler_.rssiRaw() * 9 + 7) / 15);   // 0..15 -> 0..9
+        f.sMeter    = handler_.rssiRaw();   // 0..15 (0..9 = S0..S9, 10..15 = S9+)
         f.sqOpen    = handler_.sqOpen();
         f.tx        = audio_.txToRadio() || handler_.inTx();
         f.shift     = shiftOf(rf.tx_mhz, rf.rx_mhz);
@@ -256,6 +256,23 @@ public:
         }
         // Fréquence AFFICHÉE : émission pendant le PTT, réception sinon.
         f.rxMHz     = (f.tx && rf.tx_mhz > 1.0) ? rf.tx_mhz : rf.rx_mhz;
+
+        // Double veille : afficher les deux VFO ; la grande fréquence suit le
+        // VFO en cours de réception (rapporté par le poste, sinon le primaire).
+        if (handler_.doubleChannel() != 0) {
+            uint8_t idA = handler_.channelA(), idB = handler_.channelB();
+            RadioState::ActiveRf rfA = handler_.channelRf(idA);
+            RadioState::ActiveRf rfB = handler_.channelRf(idB);
+            f.dualWatch  = true;
+            f.channelIdB = idB;
+            strlcpy(f.channelB, handler_.channelName(idB).c_str(), sizeof(f.channelB));
+            f.rxMHzB     = rfB.rx_mhz;
+            f.activeIsB  = (handler_.rxVfoActive() == 1);
+            const RadioState::ActiveRf& act = f.activeIsB ? rfB : rfA;
+            f.channelId  = f.activeIsB ? idB : idA;
+            strlcpy(f.channel, handler_.channelName(f.channelId).c_str(), sizeof(f.channel));
+            if (!f.tx) { f.rxMHz = act.rx_mhz; f.wide = act.wide; f.shift = shiftOf(act.tx_mhz, act.rx_mhz); }
+        }
 #if TNC_ENABLE
         f.txAprs    = f.tx && (millis() - beaconQueuedMs_ < 6000);
         // Pendant la balise APRS, l'écran montre le canal APRS (celui sur lequel

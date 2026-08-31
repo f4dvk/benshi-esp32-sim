@@ -531,7 +531,8 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define DISPLAY_DRIVER_ILI9341   1   // force le pilote ILI9341 (+ tactile)
 #define DISPLAY_DRIVER_AUTO      2   // détection : ID 0x9341 -> ILI9341 ;
                                      //   ID 0x9225 -> ILI9225 ; rien -> aucun
-#define DISPLAY_DRIVER           DISPLAY_DRIVER_AUTO
+//#define DISPLAY_DRIVER           DISPLAY_DRIVER_AUTO
+#define DISPLAY_DRIVER           DISPLAY_DRIVER_ILI9341
 // BEAUCOUP de modules ILI9225 SPI n'ont PAS de broche MISO/SDO -> impossible
 // de lire leur ID. Par défaut, en AUTO, tout écran qui n'est pas un ILI9341
 // est donc supposé être un ILI9225. Mettre à false pour une détection stricte
@@ -547,7 +548,7 @@ static const uint8_t  DEFAULT_REGION      = 0;
 #define DISPLAY_SPI_SCK          14
 #define DISPLAY_SPI_MOSI         13
 #define DISPLAY_SPI_MISO         35   // entrée seule ; REQUIS pour la détection auto (+ tactile)
-#define DISPLAY_CS_PIN           27
+#define DISPLAY_CS_PIN           23   // 27 non sorti sur certaines cartes "ESP32 mini" ; 23 = libre
 #define DISPLAY_DC_PIN           33   // = RS
 #define DISPLAY_RST_PIN          22   // -1 = câblé sur EN / 3,3 V + RC
 #define DISPLAY_LED_PIN         (-1)  // -1 = câblé sur 3,3 V ; sinon GPIO (PWM possible)

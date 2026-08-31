@@ -124,12 +124,18 @@ public:
     uint8_t channelB() const {
         return (uint8_t)((settings_[0] & 0x0F) | ((settings_[9] & 0x0F) << 4));
     }
-    uint8_t doubleChannel() const { return (settings_[1] & 0x30) >> 4; } // 0=off,1=VFO A,2=VFO B
+    // Double veille : 0 = off, sinon activée (HTCommander écrit 1 ; certains
+    // firmwares codent aussi le VFO primaire ici : 1 = A, 2 = B).
+    uint8_t doubleChannel() const { return (settings_[1] & 0x30) >> 4; }
+    // VFO sélectionné / primaire : 0 = A, 1 = B. HTCommander le porte dans
+    // settings_[8] bits 1-2 (champ "vfoX") indépendamment de la double veille.
+    uint8_t vfoX() const { return (settings_.size() > 8) ? ((settings_[8] & 0x06) >> 1) : 0; }
+    bool    onVfoB() const { return vfoX() == 1 || doubleChannel() == 2; }
 
-    // Fixe le canal du VFO actif (A, ou B si double-veille sur B). Persiste.
+    // Fixe le canal du VFO actif (A, ou B si le VFO B est sélectionné). Persiste.
     void setActiveChannel(uint8_t id) {
         if (id >= CHANNEL_COUNT) return;
-        bool onB = (doubleChannel() == 2);
+        bool onB = onVfoB();
         if (onB) {
             settings_[0] = (uint8_t)((settings_[0] & 0xF0) | (id & 0x0F));
             settings_[9] = (uint8_t)((settings_[9] & 0xF0) | ((id >> 4) & 0x0F));
@@ -160,7 +166,7 @@ public:
 
     // Canal actuellement "actif" -> renvoye par GET_HT_STATUS.
     uint8_t activeChannelId() const {
-        uint8_t id = (doubleChannel() == 2) ? channelB() : channelA();
+        uint8_t id = onVfoB() ? channelB() : channelA();
         return (id < CHANNEL_COUNT) ? id : 0;
     }
 

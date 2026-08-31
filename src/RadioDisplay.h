@@ -115,6 +115,15 @@ private:
     int dotX()       const { return digX(2) + FDW + 3; }
     int smallX()     const { return digX(5) + FDW + 3; }
 
+    // S-mètre 0..15 -> remplissage 0..BAR_W (échelle Icom : S0..S9 sur les 60 %
+    // gauche, S9+ sur les 40 % restants ; ~6 crans RSSI = +60 dB).
+    static int sMeterFill(int sm) {
+        const int s9 = BAR_W * 60 / 100;
+        if (sm <= 9) return sm * s9 / 9;
+        int f = s9 + (sm - 9) * (BAR_W - s9) / 6;
+        return f > BAR_W ? BAR_W : f;
+    }
+
     // Chiffres 0..9 en matrice 5 colonnes x 9 lignes (bit4 = colonne de gauche).
     static const uint8_t* digGlyph(char c) {
         static const uint8_t g[10][DM_ROWS] = {
@@ -243,28 +252,45 @@ private:
             if (F || recolor) tft_.fillRect(dotX(), FY + FDH - 7, 7, 7, on);
         }
 
-        // ---- badge mode (encadré, style Icom) ----
-        if (F || f.wide != c_.wide) {
-            tft_.drawRect(2, MODE_Y - 2, 82, 13, LINE);
-            tft_.fillRect(4, MODE_Y, 78, 9, BG);
-            tft_.text(6,  MODE_Y, "FM", C_WHITE, BG, 1);
-            tft_.text(28, MODE_Y, f.wide ? "W 25k" : "N 12k", LBL, BG, 1);
-        }
-        // ---- heure UTC (GPS) sur la ligne mode ----
-        if (F || strcmp(f.utc, c_.utc)) {
-            char t[16];
-            snprintf(t, sizeof(t), "UTC %s", f.utc[0] ? f.utc : "--:--:--");
-            tft_.fillRect(92, MODE_Y, 100, 8, BG);
-            tft_.text(94, MODE_Y, t, f.utc[0] ? OKG : DIM, BG, 1);
+        // ---- ligne mode : badge FM + UTC, OU (double veille) les 2 VFO ----
+        bool dwChg = F || (f.dualWatch != c_.dualWatch);
+        if (dwChg && !F) tft_.fillRect(0, MODE_Y - 2, W, 14, BG);   // efface l'autre disposition
+
+        if (f.dualWatch) {
+            bool nmChg = dwChg || f.activeIsB != c_.activeIsB
+                      || strcmp(f.channel, c_.channel) || strcmp(f.channelB, c_.channelB);
+            if (nmChg) {
+                char a[12], b[12];
+                snprintf(a, sizeof(a), "A:%.7s", f.channel);
+                snprintf(b, sizeof(b), "B:%.7s", f.channelB);
+                tft_.fillRect(0, MODE_Y, W, 9, BG);
+                tft_.text(4,   MODE_Y, "DW", AMBER, BG, 1);
+                tft_.text(26,  MODE_Y, a, f.activeIsB ? DIM : AMBER, BG, 1);
+                tft_.text(120, MODE_Y, b, f.activeIsB ? AMBER : DIM, BG, 1);
+            }
+        } else {
+            // ---- badge mode (encadré, style Icom) ----
+            if (dwChg || f.wide != c_.wide) {
+                tft_.drawRect(2, MODE_Y - 2, 82, 13, LINE);
+                tft_.fillRect(4, MODE_Y, 78, 9, BG);
+                tft_.text(6,  MODE_Y, "FM", C_WHITE, BG, 1);
+                tft_.text(28, MODE_Y, f.wide ? "W 25k" : "N 12k", LBL, BG, 1);
+            }
+            // ---- heure UTC (GPS) sur la ligne mode ----
+            if (dwChg || strcmp(f.utc, c_.utc)) {
+                char t[16];
+                snprintf(t, sizeof(t), "UTC %s", f.utc[0] ? f.utc : "--:--:--");
+                tft_.fillRect(92, MODE_Y, 100, 8, BG);
+                tft_.text(94, MODE_Y, t, f.utc[0] ? OKG : DIM, BG, 1);
+            }
         }
 
         // ---- S-mètre : barre proportionnelle, calée sur l'échelle Icom ----
         //  (S0..S9 occupe les 60 % gauche de la barre, cf. sScale()).
         if (F || f.sMeter != c_.sMeter) {
-            int span = BAR_W * 60 / 100;
-            int fill  = (int)f.sMeter * span / 9;
-            int oldf  = (int)c_.sMeter * span / 9;
-            uint16_t col = f.sMeter >= 9 ? REDX : (f.sMeter >= 8 ? AMBER : MTRG);
+            int fill  = sMeterFill(f.sMeter);
+            int oldf  = sMeterFill(c_.sMeter);
+            uint16_t col = f.sMeter >= 12 ? REDX : (f.sMeter >= 10 ? AMBER : MTRG);
             if (F) { tft_.fillRect(BAR_X, BAR_Y2, BAR_W, BAR_H, PANEL); oldf = 0; }
             if (fill > oldf) tft_.fillRect(BAR_X + oldf, BAR_Y2, fill - oldf, BAR_H, col);
             if (fill < oldf) tft_.fillRect(BAR_X + fill, BAR_Y2, oldf - fill, BAR_H, PANEL);

@@ -60,6 +60,22 @@ public:
     String  activeChannelName() { return state_.activeChannelName(); }
     uint8_t activeChannelId()   { return state_.activeChannelId(); }
 
+    // Double veille : 0 = off, 1 = VFO A principal, 2 = VFO B principal.
+    uint8_t doubleChannel() const { return state_.doubleChannel(); }
+    uint8_t channelA()      const { return state_.channelA(); }
+    uint8_t channelB()      const { return state_.channelB(); }
+    // VFO à mettre en avant sur l'écran : celui sur lequel le poste s'est
+    // verrouillé s'il reçoit un signal en double veille, sinon le VFO primaire.
+    uint8_t rxVfoActive() const {
+#if RF_MODULE_UVK5_ENABLE
+        if (uvk5_ && uvk5_->present()) {
+            const UvK5::Status& s = uvk5_->lastStatus();
+            if (s.dualWatch && s.sig) return s.rxVfo;
+        }
+#endif
+        return state_.onVfoB() ? 1 : 0;
+    }
+
     // Accès lecture seule pour l'écran de façade.
     RadioState::ActiveRf activeRf() { return state_.activeRf(); }
     uint8_t rssiRaw()  const { return rssi_.load(); }      // 0..15
@@ -234,6 +250,28 @@ public:
     }
 
     void syncUvK5() {
+        // Double veille : HTCommander a coché « Dual Watch » -> on programme les
+        // DEUX VFO du poste et on lui délègue l'alternance (firmware >= H18).
+        uint8_t dw = state_.doubleChannel();          // 0 off, 1 A principal, 2 B principal
+        if (dw != 0) {
+            RadioState::ActiveRf rfA = channelRf(state_.channelA());
+            RadioState::ActiveRf rfB = channelRf(state_.channelB());
+            if (rfA.rx_mhz >= 1.0 && rfB.rx_mhz >= 1.0) {
+                uint8_t prim = state_.onVfoB() ? 1 : 0;
+                bool ok = uvk5_->applyVfo(0, uvk5Params(rfA));
+                ok &= uvk5_->applyVfo(1, uvk5Params(rfB));
+                ok &= uvk5_->setRadio(prim, dw);
+                Serial.printf("[UVK5] double veille : A=canal %u (%.4f) / "
+                              "B=canal %u (%.4f), primaire %c, squelch %d -> %s\n",
+                              state_.channelA(), rfA.rx_mhz,
+                              state_.channelB(), rfB.rx_mhz,
+                              prim ? 'B' : 'A', state_.squelch(),
+                              ok ? "OK" : "ECHEC");
+                return;
+            }
+            Serial.println("[UVK5] double veille : un VFO invalide -> repli mono-VFO");
+        }
+
         RadioState::ActiveRf rf = state_.activeRf();
         if (rf.tx_mhz < 1.0 || rf.rx_mhz < 1.0) {
             Serial.printf("[UVK5] canal %u : frequences invalides -> pas de retune\n",

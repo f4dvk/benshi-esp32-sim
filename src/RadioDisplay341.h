@@ -75,6 +75,14 @@ private:
     int dotX()      const { return digX(2)+DGW+4; }
     int smallX()    const { return digX(5)+DGW+5; }
 
+    // S-mètre 0..15 -> 0..BAR_W : S0..S9 sur 60 %, S9+ sur les 40 % restants.
+    static int sMeterFill(int sm) {
+        const int s9 = BAR_W * 60 / 100;
+        if (sm <= 9) return sm * s9 / 9;
+        int f = s9 + (sm - 9) * (BAR_W - s9) / 6;
+        return f > BAR_W ? BAR_W : f;
+    }
+
     void loop() {
         tft_.fillScreen(BG);
         drawChrome();
@@ -160,28 +168,44 @@ private:
         }
 
         // mode | GPS | heure UTC (taille 2)
-        if (F || f.wide != c_.wide) {
+        bool dwChg = F || (f.dualWatch != c_.dualWatch);
+        if (dwChg && !F) tft_.fillRect(0, MODE_Y, W, 16, BG);   // efface l'autre disposition
+
+        if (f.dualWatch) {
+            bool nmChg = dwChg || f.activeIsB != c_.activeIsB
+                      || strcmp(f.channel, c_.channel) || strcmp(f.channelB, c_.channelB);
+            if (nmChg) {
+                char a[16], bb[16];
+                snprintf(a,  sizeof(a),  "A:%.9s", f.channel);
+                snprintf(bb, sizeof(bb), "B:%.9s", f.channelB);
+                tft_.fillRect(0, MODE_Y, W, 16, BG);
+                tft_.text(4,   MODE_Y, "DW", AMBER, BG, 2);
+                tft_.text(44,  MODE_Y, a,  f.activeIsB ? DIM : AMBER, BG, 2);
+                tft_.text(182, MODE_Y, bb, f.activeIsB ? AMBER : DIM, BG, 2);
+            }
+        } else {
+        if (dwChg || f.wide != c_.wide) {
             tft_.fillRect(4, MODE_Y, 150, 16, BG);
             tft_.text(4, MODE_Y, "FM", C_WHITE, BG, 2);
             tft_.text(40, MODE_Y, f.wide ? "WIDE 25k" : "NARR 12k", LBL, BG, 2);
         }
-        if (F || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
+        if (dwChg || f.gpsFix != c_.gpsFix || f.gpsSats != c_.gpsSats) {
             if (f.gpsFix >= 2) snprintf(b, sizeof(b), "%uD %02u", f.gpsFix, f.gpsSats);
             else               snprintf(b, sizeof(b), "-- --");
             tft_.fillRect(158, MODE_Y, 62, 16, BG);
             tft_.text(158, MODE_Y, b, f.gpsFix >= 2 ? OKG : DIM, BG, 2);
         }
-        if (F || strcmp(f.utc, c_.utc)) {
+        if (dwChg || strcmp(f.utc, c_.utc)) {
             const char* t = f.utc[0] ? f.utc : "--:--:--";
             tft_.fillRect(W - 102, MODE_Y, 102, 16, BG);
             tft_.textRight(W - 3, MODE_Y, t, f.utc[0] ? OKG : DIM, BG, 2);
         }
+        }
 
         // S-mètre
         if (F || f.sMeter != c_.sMeter) {
-            int span = BAR_W * 60 / 100;
-            int fill = (int)f.sMeter * span / 9, oldf = (int)c_.sMeter * span / 9;
-            uint16_t col = f.sMeter >= 9 ? REDX : (f.sMeter >= 8 ? AMBER : MTRG);
+            int fill = sMeterFill(f.sMeter), oldf = sMeterFill(c_.sMeter);
+            uint16_t col = f.sMeter >= 12 ? REDX : (f.sMeter >= 10 ? AMBER : MTRG);
             if (F) { tft_.fillRect(BAR_X, BAR_Y2, BAR_W, BAR_H, PANEL); oldf = 0; }
             if (fill > oldf) tft_.fillRect(BAR_X + oldf, BAR_Y2, fill - oldf, BAR_H, col);
             if (fill < oldf) tft_.fillRect(BAR_X + fill, BAR_Y2, oldf - fill, BAR_H, PANEL);
@@ -228,6 +252,11 @@ private:
     }
 
 #if DISPLAY_SPECTRUM
+    // Analyseur de spectre : tracé en LIGNE (polyligne reliant les points),
+    // comme sur l'ILI9225 — pas un histogramme rempli. Incrémental : chaque
+    // colonne efface EXACTEMENT le segment dessiné à la trame précédente
+    // (colY_ = haut, colYb_ = bas) puis trace le nouveau segment reliant sa
+    // hauteur à celle de la colonne précédente.
     void renderSpectrum(bool live) {
         if (live) {
             pcm_(specPcm_);
@@ -240,17 +269,28 @@ private:
         }
         const int px0 = SPX + 3, pw = SPW - 6, base = SPY + SPH - 3, ph = SPH - 6;
         bool empty = true;
+        int prevY = base;
         for (int x = 0; x < pw; x++) {
-            int bi = x * (SP_BARS - 1) / (pw - 1);
-            int h = (int)specVal_[bi] * ph / 255;
-            if (h) empty = false;
-            int ny = base - h;
-            int oy = colY_[x] ? colY_[x] : base;
-            if (ny == oy) continue;
-            uint16_t col = specVal_[bi] > 195 ? REDX : (specVal_[bi] > 115 ? AMBER : MTRG);
-            if (ny < oy) tft_.fillRect(px0 + x, ny, 1, oy - ny, col);   // monte
-            else         tft_.fillRect(px0 + x, oy, 1, ny - oy, BG);    // descend
-            colY_[x] = ny;
+            // hauteur interpolée entre deux points de specVal_
+            int fp = (pw > 1) ? x * (SP_BARS - 1) * 256 / (pw - 1) : 0;
+            int bi = fp >> 8, fr = fp & 0xFF;
+            int v0 = specVal_[bi];
+            int v1 = specVal_[bi + 1 < SP_BARS ? bi + 1 : bi];
+            int v  = v0 + (v1 - v0) * fr / 256;
+            if (v) empty = false;
+            int ny = base - v * (ph - 1) / 255;
+            uint16_t col = v > 195 ? REDX : (v > 115 ? AMBER : MTRG);
+
+            // efface le segment de la trame précédente
+            if (colYb_[x] >= colY_[x] && (colY_[x] || colYb_[x]))
+                tft_.fillRect(px0 + x, colY_[x], 1, colYb_[x] - colY_[x] + 1, BG);
+
+            int a = ny < prevY ? ny : prevY;
+            int b = ny < prevY ? prevY : ny;
+            tft_.fillRect(px0 + x, a, 1, (b - a) + 2, col);
+            colY_[x]  = (int16_t)a;
+            colYb_[x] = (int16_t)(b + 1);
+            prevY = ny;
         }
         specDrawn_ = !empty;
     }
@@ -288,7 +328,8 @@ private:
     AudioSpectrum<SP_N> spectrum_;
     int16_t  specPcm_[SP_N];
     uint8_t  specVal_[SP_BARS] = {0};
-    int16_t  colY_[SPW] = {0};
+    int16_t  colY_[SPW]  = {0};   // haut du segment tracé (par colonne)
+    int16_t  colYb_[SPW] = {0};   // bas du segment tracé (pour l'effacement exact)
     bool     specDrawn_ = false;
 #endif
 };
