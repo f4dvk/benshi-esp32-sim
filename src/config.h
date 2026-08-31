@@ -244,11 +244,17 @@ static const uint8_t  DEFAULT_REGION      = 0;
 // fermé, il est GELÉ à sa dernière valeur -> pas d'emballement sur le bruit
 // entre deux trames.
 #define AUDIO_MIC_DC_TRACK     true     // retire la composante continue (biais)
-// Polarisation de l'entrée ADC : l'ESP injecte VDD/2 sur GPIO26 (DAC2) pour
-// centrer le signal audio de la cible (couplé en alternatif via un condo),
-// exactement comme kv4p-ht. Actif uniquement hors émission.
-#define AUDIO_ADC_BIAS_ENABLE  true
-#define AUDIO_ADC_BIAS_CODE    128      // 0..255 (128 ≈ 1,65 V)
+// Polarisation de l'entrée ADC (GPIO34, entrée seule sans pull interne) :
+//   true  = l'ESP injecte VDD/2 sur GPIO26 (DAC2), comme kv4p-ht. MAIS ce
+//           DAC n'est actif QU'EN RÉCEPTION -> la polarisation disparaît en
+//           émission (sans effet : on ne lit pas l'ADC en TX).
+//   false = polarisation par un pont externe fixe (2 résistances égales du
+//           3,3 V à la masse, ex. 2 x 22 kΩ, point milieu -> GPIO34 ; audio
+//           du poste couplé par C1 1 µF ; C2 1-4,7 nF de GPIO34 à la masse
+//           pour la RF). GPIO26 est alors libre. RECOMMANDÉ en mode UV-K1
+//           piloté : polarisation permanente, aucune dépendance au DAC.
+#define AUDIO_ADC_BIAS_ENABLE  false
+#define AUDIO_ADC_BIAS_CODE    128      // 0..255 (128 ≈ 1,65 V) — si _ENABLE true
 
 // IMPORTANT : sur l'ESP32, l'ADC interne et le DAC interne partagent l'unique
 // I2S0 et NE peuvent PAS fonctionner en même temps. Le pont bascule donc I2S0
